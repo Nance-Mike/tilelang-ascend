@@ -12,6 +12,7 @@ wrapper 按约束路由：dense_ok -> dense；v3_ok -> rev3；否则 rev1。
 
 import tilelang
 from tilelang import DataType, language as T
+import contextlib
 import sys
 import torch
 
@@ -51,7 +52,7 @@ _kernel_cache = {}
 # dense kernel 本身；bitmap 是 sparseIndices 的纯函数，相同 indices 张量重复
 # 调用（评测 perf 循环、decode 类负载）直接复用。键含 (data_ptr, _version,
 # shape)：原地写会 bump _version 而失效。
-_bitmap_cache = {}          # key -> bitmap tensor
+_bitmap_cache = {}  # key -> bitmap tensor
 _BITMAP_CACHE_MAX = 2
 
 # R4 诊断：dense 路径一次性 stderr 日志（评测器逐 case 捕获 stderr，平台运行
@@ -66,10 +67,8 @@ def _dense_log_once(logged, msg):
     """同一条 dense 诊断信息只打印一次到 stderr。"""
     if msg not in logged:
         logged.add(msg)
-        try:
+        with contextlib.suppress(Exception):
             print(msg, file=sys.stderr, flush=True)
-        except Exception:
-            pass
 
 
 def _largest_pow2_le(x):
@@ -92,7 +91,7 @@ def sparse_flash_attention_fwd(
     block_I=64,
     head_block=64,
     is_causal=False,
-    input_layout=0,          # 0 = BSND, 1 = BNSD
+    input_layout=0,  # 0 = BSND, 1 = BNSD
     dtype="float16",
     sm_scale=None,
 ):
@@ -112,7 +111,7 @@ def sparse_flash_attention_fwd(
     accum_dtype = "float"
     Dk = dim_base + dim_tail
 
-    head_kv = heads // kv_groups            # G：每个 kv head 分到的 query head 数
+    head_kv = heads // kv_groups  # G：每个 kv head 分到的 query head 数
     # 大 G 切成 head_block 块；小 G 补到 >= 16（L0C 分形对齐）。
     if head_kv > head_block:
         assert head_kv % head_block == 0, "head_kv must be a multiple of head_block"
@@ -135,13 +134,13 @@ def sparse_flash_attention_fwd(
     seq_len_kv = T.symbolic("seq_len_kv")
     block_num = batch * seq_len * REPLICATE_H * kv_groups
 
-    if input_layout == 0:                   # BSND: [B, S, N, D]
+    if input_layout == 0:  # BSND: [B, S, N, D]
         q_shape = [batch, seq_len, heads, Dk]
         k_shape = [batch, seq_len_kv, kv_groups, Dk]
         v_shape = [batch, seq_len_kv, kv_groups, Dv]
         i_shape = [batch, seq_len, kv_groups, topk]
         o_shape = [batch, seq_len, heads, Dv]
-    else:                                   # BNSD: [B, N, S, D]
+    else:  # BNSD: [B, N, S, D]
         q_shape = [batch, heads, seq_len, Dk]
         k_shape = [batch, kv_groups, seq_len_kv, Dk]
         v_shape = [batch, kv_groups, seq_len_kv, Dv]
@@ -237,14 +236,14 @@ def sparse_flash_attention_fwd(
                     T.gemm_v0(acc_s_l1, kv_v_l1, acc_o_l0c, init=True)
                     T.copy(acc_o_l0c, ws_o[cid, 0:H_per_block, 0:Dv])
                     T.set_cross_flag("FIX", 3)
-                    T.wait_cross_flag(4)   # no-lag：等本迭代 V2 完成
-                T.wait_cross_flag(8)       # 尾声：等 V 写完 Output
+                    T.wait_cross_flag(4)  # no-lag：等本迭代 V2 完成
+                T.wait_cross_flag(8)  # 尾声：等 V 写完 Output
 
             # ===== Vector 作用域（AIV x2，按 vid 分工）：VG + V1 + V2 + 输出 =====
             with T.Scope("V"):
                 T.tile.fill(acc_o, 0.0)
                 T.tile.fill(sumexp, 0.0)
-                T.tile.fill(m_i, -(2.0 ** 30))
+                T.tile.fill(m_i, -(2.0**30))
 
                 for i_i in range(NI):
                     # -- VG: gather 本 topK 块的 K/V 行（按 vid 分半）--
@@ -281,7 +280,7 @@ def sparse_flash_attention_fwd(
                             T.copy(kv_ub_tail, ws_k_tail[cid, bi_i + vid * BI // 2, :])
                         T.copy(kv_ub_v, ws_v[cid, bi_i + vid * BI // 2, :])
 
-                    T.set_cross_flag("MTE3", 0)   # 通知 C1：K/V 就绪
+                    T.set_cross_flag("MTE3", 0)  # 通知 C1：K/V 就绪
 
                     # -- V1: 本块 scores 的 online safe softmax --
                     T.tile.fill(acc_s_ub, 0.0)
@@ -289,8 +288,11 @@ def sparse_flash_attention_fwd(
                         T.tile.fill(acc_s_ub_, 0.0)
                         for h_i in range(v_block):
                             T.tile.select(
-                                acc_s_ub[h_i, :], mask_ub, acc_s_ub_[h_i, :],
-                                -T.infinity(accum_dtype), "VSEL_TENSOR_SCALAR_MODE",
+                                acc_s_ub[h_i, :],
+                                mask_ub,
+                                acc_s_ub_[h_i, :],
+                                -T.infinity(accum_dtype),
+                                "VSEL_TENSOR_SCALAR_MODE",
                             )
 
                     T.copy(m_i, m_i_prev)
@@ -324,7 +326,7 @@ def sparse_flash_attention_fwd(
                         acc_s_half,
                         ws_p[cid, vid * v_block : vid * v_block + v_block, :],
                     )
-                    T.set_cross_flag("MTE3", 2)   # 通知 C2：P 就绪
+                    T.set_cross_flag("MTE3", 2)  # 通知 C2：P 就绪
 
                     # -- V2: 本块 PV 融入累积输出 --
                     T.wait_cross_flag(3)
@@ -333,7 +335,7 @@ def sparse_flash_attention_fwd(
                         acc_o_ub,
                     )
                     T.tile.add(acc_o, acc_o, acc_o_ub)
-                    T.set_cross_flag("V", 4)       # 通知下一迭代 C1
+                    T.set_cross_flag("V", 4)  # 通知下一迭代 C1
 
                 # ---- 归一化 + 写输出（全掩码行防 0/0）----
                 T.tile.add(sumexp, sumexp, 1e-30)
@@ -347,16 +349,12 @@ def sparse_flash_attention_fwd(
                     if input_layout == 0:
                         T.copy(
                             acc_o_half,
-                            Output[b_i, s_i,
-                                    H0 + vid * v_block : H0 + v_block + vid * v_block,
-                                    0:Dv],
+                            Output[b_i, s_i, H0 + vid * v_block : H0 + v_block + vid * v_block, 0:Dv],
                         )
                     else:
                         T.copy(
                             acc_o_half,
-                            Output[b_i,
-                                    H0 + vid * v_block : H0 + v_block + vid * v_block,
-                                    s_i, 0:Dv],
+                            Output[b_i, H0 + vid * v_block : H0 + v_block + vid * v_block, s_i, 0:Dv],
                         )
                 else:
                     # REPLICATE_H=1：可能 padding（H_per_block > head_kv），逐行用
@@ -375,7 +373,7 @@ def sparse_flash_attention_fwd(
                                     Output[b_i, head_idx, s_i, 0:Dv],
                                 )
 
-                T.set_cross_flag("MTE3", 8)       # 尾声：通知 C 输出完成
+                T.set_cross_flag("MTE3", 8)  # 尾声：通知 C 输出完成
 
     return main
 
@@ -396,7 +394,7 @@ def sparse_flash_attention_fwd_v3(
     n_base=256,
     gather_rows=32,
     is_causal=False,
-    input_layout=0,          # 0 = BSND, 1 = BNSD
+    input_layout=0,  # 0 = BSND, 1 = BNSD
     dtype="float16",
     sm_scale=None,
     core_num=20,
@@ -432,26 +430,26 @@ def sparse_flash_attention_fwd_v3(
     accum_dtype = "float"
     Dk = dim_base + dim_tail
 
-    G = heads // kv_groups                 # query heads per kv head
-    NM = tilelang.cdiv(G, m_base)          # head sub-blocks per group
-    NI = tilelang.cdiv(topk, n_base)       # KV blocks
+    G = heads // kv_groups  # query heads per kv head
+    NM = tilelang.cdiv(G, m_base)  # head sub-blocks per group
+    NI = tilelang.cdiv(topk, n_base)  # KV blocks
     G_pad = NM * m_base
     m_half = m_base // 2
     n_half = n_base // 2
     tail = dim_tail if dim_tail > 0 else 1
-    acc_rows = G_pad if NM > 1 else 1      # acc_gm spill only when needed
+    acc_rows = G_pad if NM > 1 else 1  # acc_gm spill only when needed
     acc_cols = dim_v if NM > 1 else 1
 
     # 静态形状：规避 tilelang 跨进程缓存 bug（符号变量版本在新子进程重试时报
     # "Unfounded symbolic var"），且磁盘缓存跨进程安全。
     kernel_count = batch_size * seq_len * kv_groups
 
-    if input_layout == 0:                   # BSND: [B, S, N, D]
+    if input_layout == 0:  # BSND: [B, S, N, D]
         q_shape = [batch_size, seq_len, heads, Dk]
         k_shape = [batch_size, seq_len_kv, kv_groups, Dk]
         i_shape = [batch_size, seq_len, kv_groups, topk]
         o_shape = [batch_size, seq_len, heads, dim_v]
-    else:                                   # BNSD: [B, N, S, D]
+    else:  # BNSD: [B, N, S, D]
         q_shape = [batch_size, heads, seq_len, Dk]
         k_shape = [batch_size, kv_groups, seq_len_kv, Dk]
         i_shape = [batch_size, kv_groups, seq_len, topk]
@@ -522,9 +520,7 @@ def sparse_flash_attention_fwd_v3(
             used_core_num = T.ceildiv(kernel_count, single_core_load)
             tail_block_size = kernel_count - (used_core_num - 1) * single_core_load
             start_idx = cid * single_core_load
-            end_idx = T.if_then_else(
-                cid == used_core_num - 1, start_idx + tail_block_size, start_idx + single_core_load
-            )
+            end_idx = T.if_then_else(cid == used_core_num - 1, start_idx + tail_block_size, start_idx + single_core_load)
 
             if cid < used_core_num:
                 # R5-P1：per-CORE 一次性初始化（提到块循环外）。逐块 zero-init
@@ -576,7 +572,7 @@ def sparse_flash_attention_fwd_v3(
 
                     # ---- prologue：softmax 状态初始化 ----
                     # （acc_gm zero-init 已上提到 per-core 作用域，见上）
-                    T.tile.fill(m_i, -(2.0 ** 30))
+                    T.tile.fill(m_i, -(2.0**30))
                     T.tile.fill(sumexp, 0.0)
                     if NM == 1:
                         T.tile.fill(acc_o_ub, 0.0)
@@ -601,22 +597,16 @@ def sparse_flash_attention_fwd_v3(
                                 if gt > 1:
                                     T.wait_flag("mte3", "mte2", task_id)
                                 for r in range(gather_rows):
-                                    idx = indices_ub[
-                                        s_stage * n_base + c * gather_rows + r + vid * n_half
-                                    ]
+                                    idx = indices_ub[s_stage * n_base + c * gather_rows + r + vid * n_half]
                                     if input_layout == 0:
-                                        T.copy(
-                                            K[b_i, idx, g_i, 0:dim_base], kv_ub[task_id, r, :]
-                                        )
+                                        T.copy(K[b_i, idx, g_i, 0:dim_base], kv_ub[task_id, r, :])
                                         if dim_tail > 0:
                                             T.copy(
                                                 K[b_i, idx, g_i, dim_base:Dk],
                                                 kv_tail_ub[task_id, r, :],
                                             )
                                     else:
-                                        T.copy(
-                                            K[b_i, g_i, idx, 0:dim_base], kv_ub[task_id, r, :]
-                                        )
+                                        T.copy(K[b_i, g_i, idx, 0:dim_base], kv_ub[task_id, r, :])
                                         if dim_tail > 0:
                                             T.copy(
                                                 K[b_i, g_i, idx, dim_base:Dk],
@@ -637,7 +627,6 @@ def sparse_flash_attention_fwd_v3(
                                 if gt < NI * (n_half // gather_rows) - 2:
                                     T.set_flag("mte3", "mte2", task_id)
 
-
                         # ---- compute(s-1)：n-iter s_stage-1 的 C1/V1/C2/V2 ----
                         # 循环体与流水化前逐字一致（i_i = s_stage - 1）。ws_1[(s-2)%2]
                         # 对 V0(s) 的 WAR 冒险由 ws_4 的 m 级握手链传递覆盖：
@@ -653,13 +642,21 @@ def sparse_flash_attention_fwd_v3(
                                 T.copy(workspace_2[cid, buf, :, :], kv_tail_l1)
                             for m_i_ in T.serial(NM):
                                 T.gemm_v0(
-                                    q_l1[m_i_, :, :], kv_l1, acc_s_l0c,
-                                    transpose_B=True, init=True, kL0Size=64,
+                                    q_l1[m_i_, :, :],
+                                    kv_l1,
+                                    acc_s_l0c,
+                                    transpose_B=True,
+                                    init=True,
+                                    kL0Size=64,
                                 )
                                 if dim_tail > 0:
                                     T.gemm_v0(
-                                        q_tail_l1[m_i_, :, :], kv_tail_l1, acc_s_l0c,
-                                        transpose_B=True, init=False, kL0Size=64,
+                                        q_tail_l1[m_i_, :, :],
+                                        kv_tail_l1,
+                                        acc_s_l0c,
+                                        transpose_B=True,
+                                        init=False,
+                                        kL0Size=64,
                                     )
                                 T.copy(
                                     acc_s_l0c,
@@ -669,9 +666,7 @@ def sparse_flash_attention_fwd_v3(
                                     workspace_4[cid, m_i_ * m_base : (m_i_ + 1) * m_base, :],
                                     p_l1,
                                 )
-                                T.gemm_v0(
-                                    p_l1, kv_l1, acc_o_l0c, init=True, kL0Size=64
-                                )
+                                T.gemm_v0(p_l1, kv_l1, acc_o_l0c, init=True, kL0Size=64)
                                 T.copy(
                                     acc_o_l0c,
                                     workspace_5[cid, m_i_ * m_base : (m_i_ + 1) * m_base, :],
@@ -707,7 +702,7 @@ def sparse_flash_attention_fwd_v3(
                                 T.reduce_max(acc_s_ub, m_new, dim=-1)
                                 T.tile.max(m_new, m_new, m_i_prev)
                                 T.tile.sub(m_i_prev, m_i_prev, m_new)
-                                T.tile.exp(m_i_prev, m_i_prev)          # alpha
+                                T.tile.exp(m_i_prev, m_i_prev)  # alpha
 
                                 T.tile.broadcast(m_bcast, m_new)
                                 T.tile.sub(acc_s_ub, acc_s_ub, m_bcast)
@@ -724,7 +719,6 @@ def sparse_flash_attention_fwd_v3(
                                 T.set_flag("v", "mte3", 1)
                                 T.wait_flag("v", "mte3", 1)
                                 T.copy(p_ub, workspace_4[cid, rows0 : rows0 + m_half, :])
-
 
                             # ---- V2：全部 m 的 rescale + 累积 ----
                             for m_i_ in T.serial(NM):
@@ -750,7 +744,6 @@ def sparse_flash_attention_fwd_v3(
                                     T.copy(acc_o_ub, acc_gm[cid, rows0 : rows0 + m_half, :])
                                     T.set_flag("mte3", "mte2", 7)
                                     T.wait_flag("mte3", "mte2", 7)
-
 
                     # ---- epilogue：归一化 + 写 Output ----
                     # 注意：下方 barrier_all 对 AUTO_CV_SYNC 交接是承重的——移除
@@ -779,16 +772,12 @@ def sparse_flash_attention_fwd_v3(
                             if input_layout == 0:
                                 T.copy(
                                     out_half,
-                                    Output[
-                                        b_i, s_i, H0 + rows0 : H0 + rows0 + m_half, 0:dim_v
-                                    ],
+                                    Output[b_i, s_i, H0 + rows0 : H0 + rows0 + m_half, 0:dim_v],
                                 )
                             else:
                                 T.copy(
                                     out_half,
-                                    Output[
-                                        b_i, H0 + rows0 : H0 + rows0 + m_half, s_i, 0:dim_v
-                                    ],
+                                    Output[b_i, H0 + rows0 : H0 + rows0 + m_half, s_i, 0:dim_v],
                                 )
                         else:
                             for r in range(m_half):
@@ -848,7 +837,7 @@ def sparse_flash_attention_fwd_dense(
     assert dim_base % 16 == 0 and (dim_tail == 0 or dim_tail % 16 == 0)
     assert heads % kv_groups == 0
     G = heads // kv_groups
-    half = m_tile // 2             # s-rows per AIV
+    half = m_tile // 2  # s-rows per AIV
 
     sm_scale = sm_scale if sm_scale is not None else (1.0 / (dim_base + dim_tail)) ** 0.5
     accum_dtype = "float"
@@ -862,7 +851,7 @@ def sparse_flash_attention_fwd_dense(
 
     @T.prim_func
     def main(
-        Q: T.Tensor([batch_size, heads, seq_len, Dk], dtype),        # BNSD
+        Q: T.Tensor([batch_size, heads, seq_len, Dk], dtype),  # BNSD
         K: T.Tensor([batch_size, kv_groups, seq_len_kv, Dk], dtype),  # BNSD
         Bitmap: T.Tensor([batch_size, kv_groups, seq_len, seq_len_kv], dtype),
         Output: T.Tensor([batch_size, heads, seq_len, dim_v], dtype),
@@ -912,9 +901,7 @@ def sparse_flash_attention_fwd_dense(
             used_core_num = T.ceildiv(kernel_count, single_core_load)
             tail_block_size = kernel_count - (used_core_num - 1) * single_core_load
             start_idx = cid * single_core_load
-            end_idx = T.if_then_else(
-                cid == used_core_num - 1, start_idx + tail_block_size, start_idx + single_core_load
-            )
+            end_idx = T.if_then_else(cid == used_core_num - 1, start_idx + tail_block_size, start_idx + single_core_load)
 
             if cid < used_core_num:
                 for block_idx in T.serial(start_idx, end_idx):
@@ -932,7 +919,7 @@ def sparse_flash_attention_fwd_dense(
                         T.copy(Q[b_i, h_i, s0 : s0 + m_tile, dim_base:Dk], q_tail_l1)
 
                     # ---- prologue（V）：softmax 状态初始化 ----
-                    T.tile.fill(m_i, -(2.0 ** 30))
+                    T.tile.fill(m_i, -(2.0**30))
                     T.tile.fill(sumexp, 0.0)
                     T.tile.fill(acc_o_ub, 0.0)
 
@@ -943,13 +930,15 @@ def sparse_flash_attention_fwd_dense(
                         T.copy(K[b_i, g_i, n0 : n0 + n_base, 0:dim_base], kv_l1)
                         if dim_tail > 0:
                             T.copy(K[b_i, g_i, n0 : n0 + n_base, dim_base:Dk], kv_tail_l1)
-                        T.gemm_v0(
-                            q_l1, kv_l1, acc_s_l0c, transpose_B=True, init=True, kL0Size=64
-                        )
+                        T.gemm_v0(q_l1, kv_l1, acc_s_l0c, transpose_B=True, init=True, kL0Size=64)
                         if dim_tail > 0:
                             T.gemm_v0(
-                                q_tail_l1, kv_tail_l1, acc_s_l0c,
-                                transpose_B=True, init=False, kL0Size=64,
+                                q_tail_l1,
+                                kv_tail_l1,
+                                acc_s_l0c,
+                                transpose_B=True,
+                                init=False,
+                                kL0Size=64,
                             )
                         T.copy(acc_s_l0c, workspace_3[cid, :, :])
                         T.copy(workspace_4[cid, :, :], p_l1)
@@ -965,24 +954,24 @@ def sparse_flash_attention_fwd_dense(
                         )
                         T.set_flag("mte2", "v", 4)
                         T.wait_flag("mte2", "v", 4)
-                        T.copy(bm_ub[i_i % 2, :, :], mask_f)           # fp16/bf16 -> f32
-                        T.tile.mul(mask_f, mask_f, 1e4)          # 1 -> 1e4, 0 -> 0
-                        T.tile.add(mask_f, mask_f, -1e4)         # 1 -> 0, 0 -> -1e4
+                        T.copy(bm_ub[i_i % 2, :, :], mask_f)  # fp16/bf16 -> f32
+                        T.tile.mul(mask_f, mask_f, 1e4)  # 1 -> 1e4, 0 -> 0
+                        T.tile.add(mask_f, mask_f, -1e4)  # 1 -> 0, 0 -> -1e4
                         T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
                         T.tile.add(acc_s_ub, acc_s_ub, mask_f)
                         T.copy(m_i, m_i_prev)
                         T.reduce_max(acc_s_ub, m_new, dim=-1)
                         T.tile.max(m_new, m_new, m_i_prev)
                         T.tile.sub(m_i_prev, m_i_prev, m_new)
-                        T.tile.exp(m_i_prev, m_i_prev)           # alpha
+                        T.tile.exp(m_i_prev, m_i_prev)  # alpha
                         T.tile.broadcast(m_bcast, m_new)
                         T.tile.sub(acc_s_ub, acc_s_ub, m_bcast)
-                        T.tile.exp(acc_s_ub, acc_s_ub)           # P
+                        T.tile.exp(acc_s_ub, acc_s_ub)  # P
                         T.reduce_sum(acc_s_ub, sum_new, dim=-1)
                         T.tile.mul(sumexp, sumexp, m_i_prev)
                         T.tile.add(sumexp, sumexp, sum_new)
                         T.copy(m_new, m_i)
-                        T.copy(acc_s_ub, p_ub)                   # f32 -> fp16/bf16
+                        T.copy(acc_s_ub, p_ub)  # f32 -> fp16/bf16
                         T.pipe_barrier("v")
                         T.set_flag("v", "mte3", 5)
                         T.wait_flag("v", "mte3", 5)
@@ -1012,6 +1001,7 @@ def sparse_flash_attention_fwd_dense(
                     )
 
     return main
+
 
 # ========== Python wrapper：路由与缓存 ==========
 
@@ -1068,14 +1058,7 @@ def sparse_flash_attention(
     m_tile_dense = 64
     G = N1 // N2
     amp = S1 * topK / S2
-    dense_ok = (
-        amp >= 16
-        and S2 % 256 == 0
-        and dim_base == 128
-        and dim_tail in (0, 64)
-        and Dv == dim_base
-        and S1 % m_tile_dense == 0
-    )
+    dense_ok = amp >= 16 and S2 % 256 == 0 and dim_base == 128 and dim_tail in (0, 64) and Dv == dim_base and S1 % m_tile_dense == 0
 
     if dense_ok:
         # 平台兼容守护（R3/R4）：CANN 构建缺 aclnn 算子变体的 SoC（如
@@ -1084,37 +1067,42 @@ def sparse_flash_attention(
         # 失败 stage 一次性打印到 stderr 供平台定位（见 _dense_log_once）。
         stage = "compile"
         try:
-            cache_key = ("dense", B, S1, S2, N1, N2, dim_base, dim_tail, Dv,
-                         layout_code, dtype_str, float(scaleValue))
+            cache_key = ("dense", B, S1, S2, N1, N2, dim_base, dim_tail, Dv, layout_code, dtype_str, float(scaleValue))
             if cache_key not in _kernel_cache:
                 _kernel_cache[cache_key] = sparse_flash_attention_fwd_dense(
-                    heads=int(N1), kv_groups=int(N2), dim_base=dim_base,
-                    dim_tail=dim_tail, dim_v=Dv, batch_size=int(B), seq_len=int(S1),
-                    seq_len_kv=int(S2), m_tile=m_tile_dense, n_base=256,
-                    dtype=dtype_str, sm_scale=float(scaleValue), core_num=20,
+                    heads=int(N1),
+                    kv_groups=int(N2),
+                    dim_base=dim_base,
+                    dim_tail=dim_tail,
+                    dim_v=Dv,
+                    batch_size=int(B),
+                    seq_len=int(S1),
+                    seq_len_kv=int(S2),
+                    m_tile=m_tile_dense,
+                    n_base=256,
+                    dtype=dtype_str,
+                    sm_scale=float(scaleValue),
+                    core_num=20,
                 )
                 _dense_log_once(
                     _dense_ok_logged,
-                    f"[sfa-dense-ok] B={B} S1={S1} S2={S2} N1={N1} N2={N2} "
-                    f"causal={bool(is_causal)} {dtype_str}",
+                    f"[sfa-dense-ok] B={B} S1={S1} S2={S2} N1={N1} N2={N2} causal={bool(is_causal)} {dtype_str}",
                 )
             # 设备侧构造 BNSD 布局 [B, N2, S1, S2] 的 0/1 bitmap（连续——kernel
             # 只发射连续 GM 源 tile）。按 sparseIndices 张量记忆化（见顶部说明）。
             bm_key = (
-                sparseIndices.data_ptr(), sparseIndices._version,
-                tuple(sparseIndices.shape), bool(is_causal), query.dtype,
+                sparseIndices.data_ptr(),
+                sparseIndices._version,
+                tuple(sparseIndices.shape),
+                bool(is_causal),
+                query.dtype,
             )
             bitmap = _bitmap_cache.get(bm_key)
             if bitmap is None:
                 stage = "indices"
-                idx32 = (
-                    sparseIndices.transpose(1, 2) if inputLayout == "BSND"
-                    else sparseIndices
-                ).contiguous()  # [B, N2, S1, topk]
+                idx32 = (sparseIndices.transpose(1, 2) if inputLayout == "BSND" else sparseIndices).contiguous()  # [B, N2, S1, topk]
                 stage = "scatter"
-                bitmap = torch.zeros(
-                    (B, N2, S1, S2), dtype=query.dtype, device=query.device
-                )
+                bitmap = torch.zeros((B, N2, S1, S2), dtype=query.dtype, device=query.device)
                 # 第一层：直接用 int32 indices——torch_npu 接受 int32 且结果与
                 # int64 逐位一致（已验证），不产生 dtype-cast 算子。第二层
                 # （scatter_ 强制 int64 的主机兜底）：用交错 [idx, 0] int32 对
@@ -1124,9 +1112,7 @@ def sparse_flash_attention(
                     bitmap.scatter_(-1, idx32, 1)
                 except Exception:
                     stage = "scatter-int64"
-                    idx = torch.stack(
-                        [idx32, torch.zeros_like(idx32)], dim=-1
-                    ).view(torch.int64).squeeze(-1)
+                    idx = torch.stack([idx32, torch.zeros_like(idx32)], dim=-1).view(torch.int64).squeeze(-1)
                     bitmap.scatter_(-1, idx, 1)
                 if is_causal:
                     # causal 将 j > s + (S2 - S1) 置零。S2 >= S1 时该区域完全
@@ -1138,11 +1124,9 @@ def sparse_flash_attention(
                     if S2 >= S1:
                         tri = _causal_tri_cache.get((S1, query.dtype))
                         if tri is None or tri.device != query.device:
-                            tri = torch.ones(
-                                S1, S1, dtype=query.dtype, device=query.device
-                            ).tril()
+                            tri = torch.ones(S1, S1, dtype=query.dtype, device=query.device).tril()
                             _causal_tri_cache[(S1, query.dtype)] = tri
-                        bitmap[:, :, :, S2 - S1:] *= tri
+                        bitmap[:, :, :, S2 - S1 :] *= tri
                     else:
                         pos = torch.arange(S2, device=bitmap.device)
                         thr = torch.arange(S1, device=bitmap.device) + (S2 - S1)
@@ -1182,38 +1166,162 @@ def sparse_flash_attention(
     # （gr=32 会把 kv_ub 推过 ~248KB 可用 UB，静默 NaN，实测）。
     n_base_v3 = 256
     gather_rows_v3 = 64 if dim_base <= 128 else 16
-    l1_bytes = (tilelang.cdiv(G, m_base_v3) * m_base_v3) * (dim_base + dim_tail) * 2 \
-        + n_base_v3 * (dim_base + dim_tail) * 2 + m_base_v3 * n_base_v3 * 2
-    v3_ok = (
-        topK % n_base_v3 == 0
-        and Dv == dim_base
-        and dim_tail in (0, 64)
-        and dim_base in (128, 512)
-        and l1_bytes <= 480 * 1024
+    l1_bytes = (
+        (tilelang.cdiv(G, m_base_v3) * m_base_v3) * (dim_base + dim_tail) * 2
+        + n_base_v3 * (dim_base + dim_tail) * 2
+        + m_base_v3 * n_base_v3 * 2
     )
+    v3_ok = topK % n_base_v3 == 0 and Dv == dim_base and dim_tail in (0, 64) and dim_base in (128, 512) and l1_bytes <= 480 * 1024
 
     if v3_ok:
-        cache_key = ("v3", B, S1, S2, N1, N2, dim_base, dim_tail, Dv, topK,
-                     bool(is_causal), layout_code, dtype_str, float(scaleValue))
+        cache_key = ("v3", B, S1, S2, N1, N2, dim_base, dim_tail, Dv, topK, bool(is_causal), layout_code, dtype_str, float(scaleValue))
         if cache_key not in _kernel_cache:
             _kernel_cache[cache_key] = sparse_flash_attention_fwd_v3(
-                heads=int(N1), kv_groups=int(N2), dim_base=dim_base, dim_tail=dim_tail,
-                dim_v=Dv, topk=topK, batch_size=int(B), seq_len=int(S1),
-                seq_len_kv=int(S2), m_base=m_base_v3, n_base=n_base_v3,
+                heads=int(N1),
+                kv_groups=int(N2),
+                dim_base=dim_base,
+                dim_tail=dim_tail,
+                dim_v=Dv,
+                topk=topK,
+                batch_size=int(B),
+                seq_len=int(S1),
+                seq_len_kv=int(S2),
+                m_base=m_base_v3,
+                n_base=n_base_v3,
                 gather_rows=gather_rows_v3,
-                is_causal=bool(is_causal), input_layout=layout_code,
-                dtype=dtype_str, sm_scale=float(scaleValue), core_num=20,
+                is_causal=bool(is_causal),
+                input_layout=layout_code,
+                dtype=dtype_str,
+                sm_scale=float(scaleValue),
+                core_num=20,
             )
         return _kernel_cache[cache_key](query, key, value, sparseIndices)
 
-    cache_key = (N1, N2, dim_base, dim_tail, Dv, topK, 64, head_block,
-                 bool(is_causal), layout_code, dtype_str, float(scaleValue))
+    cache_key = (N1, N2, dim_base, dim_tail, Dv, topK, 64, head_block, bool(is_causal), layout_code, dtype_str, float(scaleValue))
     if cache_key not in _kernel_cache:
         _kernel_cache[cache_key] = sparse_flash_attention_fwd(
-            heads=int(N1), kv_groups=int(N2), dim_base=dim_base, dim_tail=dim_tail,
-            dim_v=Dv, topk=topK, block_I=64, head_block=head_block,
-            is_causal=bool(is_causal), input_layout=layout_code,
-            dtype=dtype_str, sm_scale=float(scaleValue),
+            heads=int(N1),
+            kv_groups=int(N2),
+            dim_base=dim_base,
+            dim_tail=dim_tail,
+            dim_v=Dv,
+            topk=topK,
+            block_I=64,
+            head_block=head_block,
+            is_causal=bool(is_causal),
+            input_layout=layout_code,
+            dtype=dtype_str,
+            sm_scale=float(scaleValue),
         )
     kernel = _kernel_cache[cache_key]
     return kernel(query, key, value, sparseIndices)
+
+
+# ========== Self-test（bench_test.sh 门禁：三条 wrapper 路由路径 vs PyTorch golden）==========
+if __name__ == "__main__":
+    torch.manual_seed(42)
+
+    def _golden(query, key, value, sparseIndices, scaleValue, inputLayout="BSND", is_causal=False):
+        """PyTorch fp64 参考实现（与 cann-bench golden 语义一致）：scatter top-k
+        掩码 -> QK^T * scale -> causal 掩码 -> softmax -> PV；全掩码行输出 0。
+        """
+        q = query.double()
+        k = key.double()
+        v = value.double()
+        si = sparseIndices.long()
+        if inputLayout == "BSND":
+            q = q.permute(0, 2, 1, 3)  # [B, N1, S1, Dk]
+            k = k.permute(0, 2, 1, 3)  # [B, N2, S2, Dk]
+            v = v.permute(0, 2, 1, 3)  # [B, N2, S2, Dv]
+            si = si.permute(0, 2, 1, 3)  # [B, N2, S1, topK]
+        B, N1, S1, Dk = q.shape
+        N2 = k.shape[1]
+        S2 = k.shape[2]
+        Dv = v.shape[-1]
+        G = N1 // N2
+        mask = torch.zeros(B, N2, S1, S2, dtype=torch.bool)
+        mask.scatter_(-1, si, True)
+        if is_causal:
+            s1_idx = torch.arange(S1).unsqueeze(-1)
+            s2_idx = torch.arange(S2).unsqueeze(0)
+            mask = mask & (s2_idx <= s1_idx + (S2 - S1))
+        q_g = q.reshape(B, N2, G, S1, Dk)
+        scores = torch.einsum("bngsd,bnkd->bngsk", q_g, k) * scaleValue
+        scores = scores.masked_fill(~mask.unsqueeze(2), float("-inf"))
+        scores_max = scores.max(dim=-1, keepdim=True).values
+        all_masked = torch.isinf(scores_max) & (scores_max < 0)
+        scores = scores - scores_max
+        scores.exp_()
+        scores = torch.where(all_masked, torch.zeros_like(scores), scores / scores.sum(dim=-1, keepdim=True))
+        out = torch.einsum("bngsk,bnkd->bngsd", scores, v).reshape(B, N1, S1, Dv)
+        if inputLayout == "BSND":
+            return out.permute(0, 2, 1, 3).contiguous()
+        return out.contiguous()
+
+    def _make_inputs(B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str, seed):
+        """随机输入：value == key[..., :Dv] 前缀契约 + 互异 topK 索引。"""
+        dt = torch.float16 if dtype_str == "float16" else torch.bfloat16
+        g = torch.Generator().manual_seed(seed)
+        q = (torch.rand(B, S1, N1, Dk, generator=g) * 2 - 1).to(dt)
+        k = (torch.rand(B, S2, N2, Dk, generator=g) * 2 - 1).to(dt)
+        v = k[..., :Dv].clone()
+        n_groups = B * S1 * N2
+        kk = min(topK, S2)
+        sel = torch.rand(n_groups, S2, generator=g).argsort(dim=1)[:, :kk]
+        if kk < topK:
+            sel = torch.cat([sel, sel[:, -1:].expand(n_groups, topK - kk)], dim=1)
+        si = sel.reshape(B, S1, N2, topK).to(torch.int32)
+        if layout == "BNSD":
+            q = q.permute(0, 2, 1, 3).contiguous()
+            k = k.permute(0, 2, 1, 3).contiguous()
+            v = v.permute(0, 2, 1, 3).contiguous()
+            si = si.permute(0, 2, 1, 3).contiguous()
+        return q, k, v, si
+
+    def _run_case(name, B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str):
+        scale = 1.0 / (Dk**0.5)
+        q, k, v, si = _make_inputs(B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str, seed=42)
+        out = sparse_flash_attention(
+            query=q.npu(),
+            key=k.npu(),
+            value=v.npu(),
+            sparseIndices=si.npu(),
+            scaleValue=scale,
+            inputLayout=layout,
+            is_causal=False,
+        )
+        torch.npu.synchronize()
+        ref = _golden(q, k, v, si, scale, layout)
+        a = out.detach().cpu().double()
+        g = ref.to(out.dtype).double()  # golden 截断到输出 dtype（对齐 cann-bench compare 语义）
+        atol = rtol = 1e-3 if dtype_str == "float16" else 8e-3
+        diff = (a - g).abs()
+        ok = bool((diff <= atol + rtol * g.abs()).all().item())
+        tag = "PASS" if ok else "FAIL"
+        print(
+            f"[{tag}] {name}: layout={layout} B={B} S1={S1} S2={S2} "
+            f"N1={N1} N2={N2} Dk={Dk} Dv={Dv} topK={topK} dtype={dtype_str} "
+            f"max_abs={float(diff.max()):.3e}"
+        )
+        return ok
+
+    # 三条 wrapper 路由路径各取一个小 shape：
+    #   v3   : topK%256==0 且 Dv==dim_base 的 decode 形状（amp < 16 绕开 dense）
+    #   dense: S1*topK/S2 >= 16 的高查询复用形状（平台缺 aclnn 变体时 wrapper 内部回退，语义不变）
+    #   rev1 : topK 非 256 整除的兜底形状
+    cases = [
+        ("v3_decode", 16, 1, 1024, 32, 8, 128, 128, 512, "BSND", "float16"),
+        ("dense_reuse", 2, 256, 1024, 32, 8, 128, 128, 512, "BSND", "float16"),
+        ("rev1_fallback", 1, 16, 2048, 128, 8, 128, 128, 384, "BSND", "float16"),
+    ]
+    all_ok = True
+    for name, B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str in cases:
+        try:
+            all_ok &= _run_case(name, B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str)
+        except Exception as e:
+            print(f"[FAIL] {name}: {type(e).__name__}: {e}")
+            all_ok = False
+
+    if not all_ok:
+        sys.exit(1)
+    print("Test Passed!")
