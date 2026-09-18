@@ -1217,111 +1217,44 @@ def sparse_flash_attention(
     return kernel(query, key, value, sparseIndices)
 
 
-# ========== Self-test（bench_test.sh 门禁：三条 wrapper 路由路径 vs PyTorch golden）==========
+# ---------------------------------------------------------------------------
+# Standalone run entry (smoke test, picked from test_sparse_flash_attention.py L0 case)
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    torch.manual_seed(42)
+    torch.manual_seed(0)
 
-    def _golden(query, key, value, sparseIndices, scaleValue, inputLayout="BSND", is_causal=False):
-        """PyTorch fp64 参考实现（与 cann-bench golden 语义一致）：scatter top-k
-        掩码 -> QK^T * scale -> causal 掩码 -> softmax -> PV；全掩码行输出 0。
-        """
-        q = query.double()
-        k = key.double()
-        v = value.double()
-        si = sparseIndices.long()
-        if inputLayout == "BSND":
-            q = q.permute(0, 2, 1, 3)  # [B, N1, S1, Dk]
-            k = k.permute(0, 2, 1, 3)  # [B, N2, S2, Dk]
-            v = v.permute(0, 2, 1, 3)  # [B, N2, S2, Dv]
-            si = si.permute(0, 2, 1, 3)  # [B, N2, S1, topK]
-        B, N1, S1, Dk = q.shape
-        N2 = k.shape[1]
-        S2 = k.shape[2]
-        Dv = v.shape[-1]
-        G = N1 // N2
-        mask = torch.zeros(B, N2, S1, S2, dtype=torch.bool)
-        mask.scatter_(-1, si, True)
-        if is_causal:
-            s1_idx = torch.arange(S1).unsqueeze(-1)
-            s2_idx = torch.arange(S2).unsqueeze(0)
-            mask = mask & (s2_idx <= s1_idx + (S2 - S1))
-        q_g = q.reshape(B, N2, G, S1, Dk)
-        scores = torch.einsum("bngsd,bnkd->bngsk", q_g, k) * scaleValue
-        scores = scores.masked_fill(~mask.unsqueeze(2), float("-inf"))
-        scores_max = scores.max(dim=-1, keepdim=True).values
-        all_masked = torch.isinf(scores_max) & (scores_max < 0)
-        scores = scores - scores_max
-        scores.exp_()
-        scores = torch.where(all_masked, torch.zeros_like(scores), scores / scores.sum(dim=-1, keepdim=True))
-        out = torch.einsum("bngsk,bnkd->bngsd", scores, v).reshape(B, N1, S1, Dv)
-        if inputLayout == "BSND":
-            return out.permute(0, 2, 1, 3).contiguous()
-        return out.contiguous()
+    # L0 v3_decode case: BSND fp16 decode shape (topK%256==0, Dv==dim_base -> v3)
+    B, S1, S2, N1, N2, Dk, Dv, topK = 16, 1, 1024, 32, 8, 128, 128, 512
+    scale = 1.0 / (Dk**0.5)
+    gen = torch.Generator().manual_seed(42)
+    q = (torch.rand(B, S1, N1, Dk, generator=gen) * 2 - 1).to(torch.float16)
+    k = (torch.rand(B, S2, N2, Dk, generator=gen) * 2 - 1).to(torch.float16)
+    v = k[..., :Dv].clone()  # value == key[..., :Dv] prefix contract
+    sel = torch.rand(B * S1 * N2, S2, generator=gen).argsort(dim=1)[:, :topK]
+    si = sel.reshape(B, S1, N2, topK).to(torch.int32)
 
-    def _make_inputs(B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str, seed):
-        """随机输入：value == key[..., :Dv] 前缀契约 + 互异 topK 索引。"""
-        dt = torch.float16 if dtype_str == "float16" else torch.bfloat16
-        g = torch.Generator().manual_seed(seed)
-        q = (torch.rand(B, S1, N1, Dk, generator=g) * 2 - 1).to(dt)
-        k = (torch.rand(B, S2, N2, Dk, generator=g) * 2 - 1).to(dt)
-        v = k[..., :Dv].clone()
-        n_groups = B * S1 * N2
-        kk = min(topK, S2)
-        sel = torch.rand(n_groups, S2, generator=g).argsort(dim=1)[:, :kk]
-        if kk < topK:
-            sel = torch.cat([sel, sel[:, -1:].expand(n_groups, topK - kk)], dim=1)
-        si = sel.reshape(B, S1, N2, topK).to(torch.int32)
-        if layout == "BNSD":
-            q = q.permute(0, 2, 1, 3).contiguous()
-            k = k.permute(0, 2, 1, 3).contiguous()
-            v = v.permute(0, 2, 1, 3).contiguous()
-            si = si.permute(0, 2, 1, 3).contiguous()
-        return q, k, v, si
+    out = sparse_flash_attention(
+        query=q.npu(),
+        key=k.npu(),
+        value=v.npu(),
+        sparseIndices=si.npu(),
+        scaleValue=scale,
+        inputLayout="BSND",
+        is_causal=False,
+    )
+    torch.npu.synchronize()
 
-    def _run_case(name, B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str):
-        scale = 1.0 / (Dk**0.5)
-        q, k, v, si = _make_inputs(B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str, seed=42)
-        out = sparse_flash_attention(
-            query=q.npu(),
-            key=k.npu(),
-            value=v.npu(),
-            sparseIndices=si.npu(),
-            scaleValue=scale,
-            inputLayout=layout,
-            is_causal=False,
-        )
-        torch.npu.synchronize()
-        ref = _golden(q, k, v, si, scale, layout)
-        a = out.detach().cpu().double()
-        g = ref.to(out.dtype).double()  # golden 截断到输出 dtype（对齐 cann-bench compare 语义）
-        atol = rtol = 1e-3 if dtype_str == "float16" else 8e-3
-        diff = (a - g).abs()
-        ok = bool((diff <= atol + rtol * g.abs()).all().item())
-        tag = "PASS" if ok else "FAIL"
-        print(
-            f"[{tag}] {name}: layout={layout} B={B} S1={S1} S2={S2} "
-            f"N1={N1} N2={N2} Dk={Dk} Dv={Dv} topK={topK} dtype={dtype_str} "
-            f"max_abs={float(diff.max()):.3e}"
-        )
-        return ok
+    # Compact fp64 reference (BSND, non-causal):
+    # scatter top-k mask -> QK^T * scale -> softmax -> PV
+    qp, kp, vp = (t.double().permute(0, 2, 1, 3) for t in (q, k, v))  # [B, N, S, D]
+    sp = si.long().permute(0, 2, 1, 3)  # [B, N2, S1, topK]
+    G = N1 // N2
+    mask = torch.zeros(B, N2, S1, S2, dtype=torch.bool)
+    mask.scatter_(-1, sp, True)
+    scores = torch.einsum("bngsd,bnkd->bngsk", qp.reshape(B, N2, G, S1, Dk), kp) * scale
+    p = torch.softmax(scores.masked_fill(~mask.unsqueeze(2), float("-inf")), dim=-1)
+    ref = torch.einsum("bngsk,bnkd->bngsd", p, vp).reshape(B, N1, S1, Dv)
+    ref = ref.permute(0, 2, 1, 3).contiguous().to(out.dtype)
 
-    # 三条 wrapper 路由路径各取一个小 shape：
-    #   v3   : topK%256==0 且 Dv==dim_base 的 decode 形状（amp < 16 绕开 dense）
-    #   dense: S1*topK/S2 >= 16 的高查询复用形状（平台缺 aclnn 变体时 wrapper 内部回退，语义不变）
-    #   rev1 : topK 非 256 整除的兜底形状
-    cases = [
-        ("v3_decode", 16, 1, 1024, 32, 8, 128, 128, 512, "BSND", "float16"),
-        ("dense_reuse", 2, 256, 1024, 32, 8, 128, 128, 512, "BSND", "float16"),
-        ("rev1_fallback", 1, 16, 2048, 128, 8, 128, 128, 384, "BSND", "float16"),
-    ]
-    all_ok = True
-    for name, B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str in cases:
-        try:
-            all_ok &= _run_case(name, B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str)
-        except Exception as e:
-            print(f"[FAIL] {name}: {type(e).__name__}: {e}")
-            all_ok = False
-
-    if not all_ok:
-        sys.exit(1)
-    print("Test Passed!")
+    torch.testing.assert_close(out.cpu().float(), ref.float(), rtol=1e-3, atol=1e-3)
+    print("Kernel Output Match!")
