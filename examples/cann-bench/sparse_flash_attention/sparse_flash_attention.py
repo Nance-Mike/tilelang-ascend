@@ -48,10 +48,11 @@ _kernel_cache = {}
 # R5-P1（已否决）：按行排序 sparseIndices 做 gather 局部性——aclnnSort 在 NPU
 # 上代价病态（65K 元素 6.1ms，超线性增长），远超 500us kernel 的局部性收益。
 
-# Dense 路径 bitmap 记忆化（R3-2）：scatter 构造 0/1 bitmap 耗 ~450ns/idx，超过
-# dense kernel 本身；bitmap 是 sparseIndices 的纯函数，相同 indices 张量重复
-# 调用（评测 perf 循环、decode 类负载）直接复用。键含 (data_ptr, _version,
-# shape)：原地写会 bump _version 而失效。
+# Dense-path bitmap memoization (R3-2): building the 0/-inf bitmap via scatter
+# costs ~450ns/idx, more than the dense kernel itself; the bitmap is a pure
+# function of sparseIndices, so repeated calls with the same indices tensor
+# (eval perf loops, decode-style loads) reuse it directly. The key carries
+# (data_ptr, _version, shape): in-place writes bump _version and invalidate.
 _bitmap_cache = {}  # key -> bitmap tensor
 _BITMAP_CACHE_MAX = 2
 
@@ -72,11 +73,30 @@ def _dense_log_once(logged, msg):
 
 
 def _largest_pow2_le(x):
-    """不超过 x 的最大 2 的幂（Dk 切分：128/192 -> 128，512/576 -> 512）。"""
+    """Largest power of two <= x (Dk split: 128/192 -> 128, 512/576 -> 512)."""
     p = 1
     while p * 2 <= x:
         p *= 2
     return p
+
+
+_core_num_cached = None
+
+
+def _ai_core_num():
+    """Physical cube core count of the current NPU (A3 / Ascend910 = 20).
+
+    v3/dense launch one kernel block per cube core (each block pairs with
+    two vector cores via vid). A hardcoded count would idle cores on larger
+    SoCs (e.g. 24-core parts) or oversubscribe smaller ones.
+    """
+    global _core_num_cached
+    if _core_num_cached is None:
+        try:
+            _core_num_cached = int(torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num)
+        except Exception:
+            _core_num_cached = 20  # A3 baseline; conservative fallback
+    return _core_num_cached
 
 
 # ========== rev1 kernel：混合模式兜底路径 ==========
@@ -111,8 +131,11 @@ def sparse_flash_attention_fwd(
     accum_dtype = "float"
     Dk = dim_base + dim_tail
 
-    head_kv = heads // kv_groups  # G：每个 kv head 分到的 query head 数
-    # 大 G 切成 head_block 块；小 G 补到 >= 16（L0C 分形对齐）。
+    head_kv = heads // kv_groups  # G: query heads per kv head
+    # Large G is split into head_block chunks; small G is padded to >= 16
+    # (L0C fractal alignment). H_per_block must stay even: the vector side
+    # covers rows as 2 * v_block (one half per AIV), so an odd value would
+    # silently drop the last query head.
     if head_kv > head_block:
         assert head_kv % head_block == 0, "head_kv must be a multiple of head_block"
         REPLICATE_H = head_kv // head_block
@@ -120,6 +143,8 @@ def sparse_flash_attention_fwd(
     else:
         REPLICATE_H = 1
         H_per_block = max(head_kv, 16)
+        if H_per_block % 2 == 1:
+            H_per_block += 1
     v_block = H_per_block // 2
     ub_len = max(32 // (DataType(accum_dtype).bits // 8), v_block)  # UB 32B 对齐
 
@@ -484,8 +509,9 @@ def sparse_flash_attention_fwd_v3(
             indices_f = T.alloc_ub([topk], accum_dtype)
             mask_ub = T.alloc_ub([topk // 8], "uint8")
             mask_iter_ub = T.alloc_ub([n_base // 8], "uint8")
-            # R5-P1：加性 causal 掩码（0 / -1e4）——每 n 块只做一次 select 构造
-            # 列向量，各 m 子块用 broadcast+add 应用（替代逐行 VSEL）。
+            # R5-P1: additive causal mask (0 / -inf) - the column vector is
+            # built once per n-block via select, then applied to each m
+            # sub-block with broadcast+add (instead of per-row VSEL).
             zero_ub = T.alloc_ub([n_base], accum_dtype)
             mask_add_ub = T.alloc_ub([n_base], accum_dtype)
             kv_ub = T.alloc_ub([2, gather_rows, dim_base], dtype)
@@ -676,14 +702,16 @@ def sparse_flash_attention_fwd_v3(
                             if is_causal:
                                 m_lo = i_i * (n_base // 8)
                                 T.copy(mask_ub[m_lo : m_lo + n_base // 8], mask_iter_ub)
-                                # R5-P1：加性列掩码每 n 块只构造一次（0 = 保留，
-                                # -1e4 = 丢弃；fp32 exp 下溢 -1e4 恰为 0，等价
-                                # 旧的 -inf 逐行 select）。
+                                # Additive column mask, built once per n-block.
+                                # -inf (not a large negative constant): a
+                                # constant cancels out in the max-subtract on
+                                # fully-masked rows and would softmax the raw
+                                # scores instead of zeroing the row.
                                 T.tile.select(
                                     mask_add_ub,
                                     mask_iter_ub,
                                     zero_ub,
-                                    -1e4,
+                                    -T.infinity(accum_dtype),
                                     "VSEL_TENSOR_SCALAR_MODE",
                                 )
                             for m_i_ in T.serial(NM):
@@ -797,14 +825,18 @@ def sparse_flash_attention_fwd_v3(
     return main
 
 
-# ========== R3-2：dense 掩码 kernel（B 族，amp >= 16）==========
-# 高查询复用 shape（S1*topk/S2 >= 16）在逐 (b,s,g) gather 上受标量发射限制
-# （msprof case 1：aiv_scalar 55%）。本路径用大 tile 流式读全部 S2 行 K，把
-# top-k 选择做成 scatter bitmap 的加性掩码（golden 语义本就是 scatter 掩码的
-# 稠密注意力；-1e4 在 fp32 exp 下溢为精确 0，等价 -inf）。
+# ========== R3-2: dense bitmap-mask kernel (family B, amp >= 16) ==========
+# High query-reuse shapes (S1*topk/S2 >= 16) are scalar-issue bound on the
+# per-(b,s,g) gather (msprof case 1: aiv_scalar 55%). This path streams all
+# S2 rows of K with large tiles and turns top-k selection into an additive
+# bitmap mask (the golden semantics are dense attention over a scatter mask).
+# The bitmap carries 0 (keep) / -inf (drop): -inf makes fully-masked rows
+# output exactly zero, where a large negative constant would cancel out in
+# the online-softmax max-subtract and softmax the raw scores instead.
 #
-# 同步与 rev3 相同（AUTO_CV_SYNC 跨核交接 + 手动核内 flag）；bitmap 子拷贝
-# 先于 ws_3 拷贝发射，由后者的 flag 等待传递覆盖（MTE2 保序）。
+# Synchronization matches rev3 (AUTO_CV_SYNC cross-core handoff + manual
+# intra-core flags); the bitmap sub-copy is issued before the ws_3 copy and
+# ordered by the latter's flag wait (MTE2 ordering).
 @tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6], pass_configs=PASS_CONFIGS_V3)
 def sparse_flash_attention_fwd_dense(
     heads,
@@ -954,9 +986,10 @@ def sparse_flash_attention_fwd_dense(
                         )
                         T.set_flag("mte2", "v", 4)
                         T.wait_flag("mte2", "v", 4)
+                        # Bitmap already carries 0 (keep) / -inf (drop); -inf
+                        # zeroes fully-masked rows instead of softmaxing raw
+                        # scores (a constant cancels in max-subtract).
                         T.copy(bm_ub[i_i % 2, :, :], mask_f)  # fp16/bf16 -> f32
-                        T.tile.mul(mask_f, mask_f, 1e4)  # 1 -> 1e4, 0 -> 0
-                        T.tile.add(mask_f, mask_f, -1e4)  # 1 -> 0, 0 -> -1e4
                         T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
                         T.tile.add(acc_s_ub, acc_s_ub, mask_f)
                         T.copy(m_i, m_i_prev)
@@ -1067,7 +1100,7 @@ def sparse_flash_attention(
         # 失败 stage 一次性打印到 stderr 供平台定位（见 _dense_log_once）。
         stage = "compile"
         try:
-            cache_key = ("dense", B, S1, S2, N1, N2, dim_base, dim_tail, Dv, layout_code, dtype_str, float(scaleValue))
+            cache_key = ("dense", B, S1, S2, N1, N2, dim_base, dim_tail, Dv, layout_code, dtype_str, float(scaleValue), _ai_core_num())
             if cache_key not in _kernel_cache:
                 _kernel_cache[cache_key] = sparse_flash_attention_fwd_dense(
                     heads=int(N1),
@@ -1082,56 +1115,67 @@ def sparse_flash_attention(
                     n_base=256,
                     dtype=dtype_str,
                     sm_scale=float(scaleValue),
-                    core_num=20,
+                    core_num=_ai_core_num(),
                 )
                 _dense_log_once(
                     _dense_ok_logged,
                     f"[sfa-dense-ok] B={B} S1={S1} S2={S2} N1={N1} N2={N2} causal={bool(is_causal)} {dtype_str}",
                 )
-            # 设备侧构造 BNSD 布局 [B, N2, S1, S2] 的 0/1 bitmap（连续——kernel
-            # 只发射连续 GM 源 tile）。按 sparseIndices 张量记忆化（见顶部说明）。
+            # Build the BNSD-layout [B, N2, S1, S2] additive bitmap on device:
+            # 0 = keep (selected), -inf = drop. -inf (not a large negative
+            # constant) keeps fully-masked rows at exactly zero output.
+            # Memoized per sparseIndices tensor (see note at top of file).
             bm_key = (
                 sparseIndices.data_ptr(),
                 sparseIndices._version,
                 tuple(sparseIndices.shape),
                 bool(is_causal),
                 query.dtype,
+                int(S2),  # bitmap width / row stride; a stale hit across
+                # different S2 would misalign or overread the mask
+                inputLayout,  # indices layout semantics (shape alone can
+                # collide between BSND/BNSD when S1 == N2)
+                sparseIndices.device,
             )
             bitmap = _bitmap_cache.get(bm_key)
             if bitmap is None:
                 stage = "indices"
                 idx32 = (sparseIndices.transpose(1, 2) if inputLayout == "BSND" else sparseIndices).contiguous()  # [B, N2, S1, topk]
                 stage = "scatter"
-                bitmap = torch.zeros((B, N2, S1, S2), dtype=query.dtype, device=query.device)
-                # 第一层：直接用 int32 indices——torch_npu 接受 int32 且结果与
-                # int64 逐位一致（已验证），不产生 dtype-cast 算子。第二层
-                # （scatter_ 强制 int64 的主机兜底）：用交错 [idx, 0] int32 对
-                # 重解释为小端 int64（非负索引下等价于 idx），绕开 aclnnCast。
-                # scatter 写 1，第一层失败前的部分写入无害（幂等重散射）。
+                bitmap = torch.full((B, N2, S1, S2), float("-inf"), dtype=query.dtype, device=query.device)
+                # Layer 1: int32 indices directly - torch_npu accepts int32 and
+                # matches int64 bit-for-bit (verified), avoiding a dtype-cast
+                # op. Layer 2 (host fallback for the SoCs where scatter_ forces
+                # int64): reinterpret interleaved [idx, 0] int32 pairs as
+                # little-endian int64 (equal to idx for non-negative indices),
+                # bypassing aclnnCast. Scatter writes 0; partial writes from a
+                # failed layer 1 are harmless (idempotent re-scatter).
                 try:
-                    bitmap.scatter_(-1, idx32, 1)
+                    bitmap.scatter_(-1, idx32, 0)
                 except Exception:
                     stage = "scatter-int64"
                     idx = torch.stack([idx32, torch.zeros_like(idx32)], dim=-1).view(torch.int64).squeeze(-1)
-                    bitmap.scatter_(-1, idx, 1)
+                    bitmap.scatter_(-1, idx, 0)
                 if is_causal:
-                    # causal 将 j > s + (S2 - S1) 置零。S2 >= S1 时该区域完全
-                    # 落在最后 S1 列，构成下三角 [S1, S1] 模式——用缓存的 tril
-                    # 对窄切片相乘（近乎零成本）替代全张量 masked_fill（case 3
-                    # 实测 ~650us），并从每次调用的算子链中去掉
-                    # arange/compare/masked_fill_（减少平台脆弱的 aclnn 变体）。
+                    # Causal must set j > s + (S2 - S1) to -inf. For S2 >= S1
+                    # the blocked region lies entirely in the last S1 columns
+                    # and forms a lower-triangular [S1, S1] pattern - apply the
+                    # cached tril on the narrow slice (~free) instead of a
+                    # full-tensor masked_fill (~650us measured on case 3), and
+                    # drop arange/compare/masked_fill_ from the per-call op
+                    # chain (fewer platform-fragile aclnn variants).
                     stage = "causal"
                     if S2 >= S1:
                         tri = _causal_tri_cache.get((S1, query.dtype))
                         if tri is None or tri.device != query.device:
                             tri = torch.ones(S1, S1, dtype=query.dtype, device=query.device).tril()
                             _causal_tri_cache[(S1, query.dtype)] = tri
-                        bitmap[:, :, :, S2 - S1 :] *= tri
+                        bitmap[:, :, :, S2 - S1 :].masked_fill_(tri == 0, float("-inf"))
                     else:
                         pos = torch.arange(S2, device=bitmap.device)
                         thr = torch.arange(S1, device=bitmap.device) + (S2 - S1)
                         causal = (pos.view(1, S2) > thr.view(S1, 1)).view(1, 1, S1, S2)
-                        bitmap.masked_fill_(causal, 0)
+                        bitmap.masked_fill_(causal, float("-inf"))
                 if len(_bitmap_cache) >= _BITMAP_CACHE_MAX:
                     _bitmap_cache.pop(next(iter(_bitmap_cache)))
                 _bitmap_cache[bm_key] = bitmap
@@ -1174,7 +1218,23 @@ def sparse_flash_attention(
     v3_ok = topK % n_base_v3 == 0 and Dv == dim_base and dim_tail in (0, 64) and dim_base in (128, 512) and l1_bytes <= 480 * 1024
 
     if v3_ok:
-        cache_key = ("v3", B, S1, S2, N1, N2, dim_base, dim_tail, Dv, topK, bool(is_causal), layout_code, dtype_str, float(scaleValue))
+        cache_key = (
+            "v3",
+            B,
+            S1,
+            S2,
+            N1,
+            N2,
+            dim_base,
+            dim_tail,
+            Dv,
+            topK,
+            bool(is_causal),
+            layout_code,
+            dtype_str,
+            float(scaleValue),
+            _ai_core_num(),
+        )
         if cache_key not in _kernel_cache:
             _kernel_cache[cache_key] = sparse_flash_attention_fwd_v3(
                 heads=int(N1),
@@ -1193,7 +1253,7 @@ def sparse_flash_attention(
                 input_layout=layout_code,
                 dtype=dtype_str,
                 sm_scale=float(scaleValue),
-                core_num=20,
+                core_num=_ai_core_num(),
             )
         return _kernel_cache[cache_key](query, key, value, sparseIndices)
 
