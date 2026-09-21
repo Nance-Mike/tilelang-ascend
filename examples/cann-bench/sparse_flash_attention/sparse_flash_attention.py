@@ -1,13 +1,16 @@
-"""TileLang-Ascend 稀疏 FlashAttention 算子实现。
+"""TileLang-Ascend sparse FlashAttention operator.
 
-融合 Gather -> QK^T -> online softmax -> PV。三个 kernel + wrapper 路由：
-  rev1  : 混合模式兜底路径（任意合法 shape，一个 (b,s,g) 块 per kernel block）
-  rev3  : 主力路径（固定核 + 共享 gather + 跨 n-iter 软件流水，R6 冠军版）
-  dense : 高查询复用 shape 的稠密 bitmap 掩码路径（B 族）
+Fused Gather -> QK^T -> online softmax -> PV. Three kernels + wrapper routing:
+  rev1  : hybrid-mode fallback path (any legal shape, one (b,s,g) chunk per
+          kernel block)
+  rev3  : main path (fixed cores + shared gather + software pipelining across
+          n-iters, R6 champion)
+  dense : dense bitmap-mask path for high query-reuse shapes (family B)
 
-wrapper 按约束路由：dense_ok -> dense；v3_ok -> rev3；否则 rev1。
-跨核 CV 数据经 GM workspace 中转（AUTO_CV_SYNC 同步）；各 kernel 的同步
-约束与已否决实验记录见 perf_tuning/board/optimization_log.md。
+The wrapper routes by constraints: dense_ok -> dense; v3_ok -> rev3; else rev1.
+Cross-core C/V data moves through GM workspaces (AUTO_CV_SYNC); per-kernel
+sync constraints and rejected experiments are recorded in
+perf_tuning/board/optimization_log.md.
 """
 
 import tilelang
@@ -21,16 +24,18 @@ try:
 except Exception:  # pragma: no cover - layout helper unavailable
     make_zn_layout = None
 
-# ========== 配置 ==========
-# rev1: 核内依赖用 AUTO_SYNC；跨核 CV 用手动 T.Scope("C"/"V") + cross_flag
-# （AUTO_CV_SYNC/COMBINE 不处理同迭代 V->C 依赖，且与 T.Scope 冲突）。
+# ========== Configuration ==========
+# rev1: intra-core dependencies use AUTO_SYNC; cross-core C/V handoff uses
+# manual T.Scope("C"/"V") + cross_flag (AUTO_CV_SYNC/COMBINE neither covers
+# same-iteration V->C dependencies nor composes with T.Scope).
 PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
 }
 
-# rev3/dense 冠军同步模型：AUTO_CV_SYNC 负责跨核 workspace 交接；
-# AUTO_SYNC 关闭（其对 gather 地址依赖逐行插 PipeBarrier，串行化每次行拷贝）；
-# 核内顺序用手动 set_flag/wait_flag（AscendC event id 必须在 [0,7]）。
+# rev3/dense champion sync model: AUTO_CV_SYNC handles the cross-core
+# workspace handoff; AUTO_SYNC is off (it inserts a PipeBarrier per row for
+# gather address dependencies, serializing every row copy); intra-core
+# ordering uses manual set_flag/wait_flag (AscendC event ids must be in [0,7]).
 PASS_CONFIGS_V3 = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
@@ -45,8 +50,9 @@ _DTYPE_MAP = {
 
 _kernel_cache = {}
 
-# R5-P1（已否决）：按行排序 sparseIndices 做 gather 局部性——aclnnSort 在 NPU
-# 上代价病态（65K 元素 6.1ms，超线性增长），远超 500us kernel 的局部性收益。
+# R5-P1 (rejected): sorting sparseIndices rows for gather locality - aclnnSort
+# on NPU is prohibitively expensive (6.1ms for 65K elements, superlinear
+# growth), far beyond the locality gain of a ~500us kernel.
 
 # Dense-path bitmap memoization (R3-2): building the 0/-inf bitmap via scatter
 # costs ~450ns/idx, more than the dense kernel itself; the bitmap is a pure
@@ -56,16 +62,17 @@ _kernel_cache = {}
 _bitmap_cache = {}  # key -> bitmap tensor
 _BITMAP_CACHE_MAX = 2
 
-# R4 诊断：dense 路径一次性 stderr 日志（评测器逐 case 捕获 stderr，平台运行
-# 可直接定位失败 stage 或确认 dense 生效，不影响被测路径）。
+# R4 diagnostics: one-shot stderr logs on the dense path (the evaluator
+# captures stderr per case; platform runs can directly locate the failing
+# stage or confirm dense engaged, without affecting the measured path).
 _dense_fb_logged = set()
 _dense_ok_logged = set()
-# causal bitmap 折叠用的缓存下三角 [S1, S1] 模板。
+# Cached lower-triangular [S1, S1] template for causal bitmap folding.
 _causal_tri_cache = {}
 
 
 def _dense_log_once(logged, msg):
-    """同一条 dense 诊断信息只打印一次到 stderr。"""
+    """Print each distinct dense diagnostic line to stderr once."""
     if msg not in logged:
         logged.add(msg)
         with contextlib.suppress(Exception):
@@ -99,7 +106,7 @@ def _ai_core_num():
     return _core_num_cached
 
 
-# ========== rev1 kernel：混合模式兜底路径 ==========
+# ========== rev1 kernel: hybrid-mode fallback path ==========
 @tilelang.jit(out_idx=[4], workspace_idx=[5, 6, 7, 8, 9, 10], pass_configs=PASS_CONFIGS)
 def sparse_flash_attention_fwd(
     heads,
@@ -115,10 +122,11 @@ def sparse_flash_attention_fwd(
     dtype="float16",
     sm_scale=None,
 ):
-    """rev1 混合模式 kernel：每个 kernel block 处理一个 (b, s, kv_group) 块。
+    """rev1 hybrid-mode kernel: each kernel block handles one (b, s, kv_group) chunk.
 
-    VG/C1/V1/C2/V2 五段，CV 数据经 6 个 GM workspace 中转，同迭代 V->C 依赖
-    （VG->C1、V1->C2）用手动 cross_flag 同步。
+    Five stages VG/C1/V1/C2/V2; C/V data moves through 6 GM workspaces,
+    same-iteration V->C dependencies (VG->C1, V1->C2) use manual cross_flag
+    synchronization.
     """
     assert topk % block_I == 0, "topk must be a multiple of block_I"
     assert dim_base % 16 == 0 and (dim_tail == 0 or dim_tail % 16 == 0)
@@ -147,7 +155,7 @@ def sparse_flash_attention_fwd(
         REPLICATE_H = 1
         H_per_block = (max(head_kv, 16) + 15) // 16 * 16
     v_block = H_per_block // 2
-    ub_len = max(32 // (DataType(accum_dtype).bits // 8), v_block)  # UB 32B 对齐
+    ub_len = max(32 // (DataType(accum_dtype).bits // 8), v_block)  # UB 32B alignment
 
     BI = block_I
     NI = tilelang.cdiv(topk, block_I)
@@ -192,7 +200,7 @@ def sparse_flash_attention_fwd(
             by = cid // (seq_len * REPLICATE_H) % batch
             bz = cid // (seq_len * REPLICATE_H) // batch % kv_groups
 
-            # ---- Cube 侧 buffer ----
+            # ---- Cube-side buffers ----
             q_l1 = T.alloc_L1([H_per_block, D], dtype)
             q_tail_l1 = T.alloc_L1([H_per_block, D_tail if D_tail > 0 else 1], dtype)
             kv_l1 = T.alloc_L1([BI, D], dtype)
@@ -202,7 +210,7 @@ def sparse_flash_attention_fwd(
             acc_s_l0c = T.alloc_L0C([H_per_block, BI], accum_dtype)
             acc_o_l0c = T.alloc_L0C([H_per_block, Dv], accum_dtype)
 
-            # ---- Vector 侧 buffer ----
+            # ---- Vector-side buffers ----
             acc_o = T.alloc_ub([v_block, Dv], accum_dtype)
             sumexp = T.alloc_ub([ub_len], accum_dtype)
             m_i = T.alloc_ub([ub_len], accum_dtype)
@@ -226,13 +234,14 @@ def sparse_flash_attention_fwd(
             heads_per_group = heads // kv_groups
             group_start = g_i * heads_per_group
             group_end = (g_i + 1) * heads_per_group
-            # H0/H1 单次赋值：T.Scope 内重新赋值的 Python 变量会被 tilelang 误解析
-            # （始终取首个值）。REPLICATE_H==1 时 bx % 1 == 0，H0 == group_start。
+            # H0/H1 assigned once: re-assigning a Python variable inside T.Scope
+            # trips tilelang parsing (it always takes the first value). With
+            # REPLICATE_H==1, bx % 1 == 0, so H0 == group_start.
             block_idx_in_group = bx % REPLICATE_H
             H0 = group_start + block_idx_in_group * H_per_block
             H1 = T.if_then_else(H0 + H_per_block > group_end, group_end, H0 + H_per_block)
 
-            # ===== Cube 作用域（AIC）：Q 装载 + NI 循环（C1 + C2）=====
+            # ===== Cube scope (AIC): Q load + NI loop (C1 + C2) =====
             with T.Scope("C"):
                 if input_layout == 0:
                     T.copy(Q[b_i, s_i, H0:H1, 0:D], q_l1)
@@ -244,7 +253,7 @@ def sparse_flash_attention_fwd(
                         T.copy(Q[b_i, H0:H1, s_i, D:Dk], q_tail_l1)
 
                 for _ in T.serial(NI):
-                    # -- C1: scores = Q @ K_sel^T（Dk 分 base/tail 两段累加）--
+                    # -- C1: scores = Q @ K_sel^T (Dk accumulated in base/tail halves) --
                     T.wait_cross_flag(0)
                     T.copy(ws_k_base[cid, 0:BI, 0:D], kv_l1)
                     if D_tail > 0:
@@ -262,17 +271,17 @@ def sparse_flash_attention_fwd(
                     T.gemm_v0(acc_s_l1, kv_v_l1, acc_o_l0c, init=True)
                     T.copy(acc_o_l0c, ws_o[cid, 0:H_per_block, 0:Dv])
                     T.set_cross_flag("FIX", 3)
-                    T.wait_cross_flag(4)  # no-lag：等本迭代 V2 完成
-                T.wait_cross_flag(8)  # 尾声：等 V 写完 Output
+                    T.wait_cross_flag(4)  # no-lag: wait for this iteration's V2
+                T.wait_cross_flag(8)  # epilogue: wait for V to finish the output
 
-            # ===== Vector 作用域（AIV x2，按 vid 分工）：VG + V1 + V2 + 输出 =====
+            # ===== Vector scope (AIV x2, split by vid): VG + V1 + V2 + output =====
             with T.Scope("V"):
                 T.tile.fill(acc_o, 0.0)
                 T.tile.fill(sumexp, 0.0)
                 T.tile.fill(m_i, -(2.0**30))
 
                 for i_i in range(NI):
-                    # -- VG: gather 本 topK 块的 K/V 行（按 vid 分半）--
+                    # -- VG: gather the K/V rows of this topK chunk (halved by vid) --
                     if input_layout == 0:
                         T.copy(
                             Indices[b_i, s_i, g_i, i_i * BI : i_i * BI + BI],
@@ -306,9 +315,9 @@ def sparse_flash_attention_fwd(
                             T.copy(kv_ub_tail, ws_k_tail[cid, bi_i + vid * BI // 2, :])
                         T.copy(kv_ub_v, ws_v[cid, bi_i + vid * BI // 2, :])
 
-                    T.set_cross_flag("MTE3", 0)  # 通知 C1：K/V 就绪
+                    T.set_cross_flag("MTE3", 0)  # notify C1: K/V ready
 
-                    # -- V1: 本块 scores 的 online safe softmax --
+                    # -- V1: online safe softmax over this chunk's scores --
                     T.tile.fill(acc_s_ub, 0.0)
                     if is_causal:
                         T.tile.fill(acc_s_ub_, 0.0)
@@ -352,26 +361,27 @@ def sparse_flash_attention_fwd(
                         acc_s_half,
                         ws_p[cid, vid * v_block : vid * v_block + v_block, :],
                     )
-                    T.set_cross_flag("MTE3", 2)  # 通知 C2：P 就绪
+                    T.set_cross_flag("MTE3", 2)  # notify C2: P ready
 
-                    # -- V2: 本块 PV 融入累积输出 --
+                    # -- V2: fold this chunk's PV into the accumulated output --
                     T.wait_cross_flag(3)
                     T.copy(
                         ws_o[cid, vid * v_block : vid * v_block + v_block, :],
                         acc_o_ub,
                     )
                     T.tile.add(acc_o, acc_o, acc_o_ub)
-                    T.set_cross_flag("V", 4)  # 通知下一迭代 C1
+                    T.set_cross_flag("V", 4)  # notify C1 of the next iteration
 
-                # ---- 归一化 + 写输出（全掩码行防 0/0）----
+                # ---- normalize + write output (0/0 guard for fully-masked rows) ----
                 T.tile.add(sumexp, sumexp, 1e-30)
                 for h_i in range(v_block):
                     T.tile.div(acc_o[h_i, :], acc_o[h_i, :], sumexp[h_i])
 
                 T.copy(acc_o, acc_o_half)
                 if REPLICATE_H != 1:
-                    # REPLICATE_H>1：无 padding（H_per_block <= head_kv），切片写安全；
-                    # 且规避 if_then_else 条件在 REPLICATE_H>1 下误生成回写 IR 的问题。
+                    # REPLICATE_H>1: no padding (H_per_block <= head_kv), slice
+                    # writes are safe; this also avoids if_then_else conditions
+                    # mis-generating write-back IR under REPLICATE_H>1.
                     if input_layout == 0:
                         T.copy(
                             acc_o_half,
@@ -383,8 +393,8 @@ def sparse_flash_attention_fwd(
                             Output[b_i, H0 + vid * v_block : H0 + v_block + vid * v_block, s_i, 0:Dv],
                         )
                 else:
-                    # REPLICATE_H=1：可能 padding（H_per_block > head_kv），逐行用
-                    # head_idx < H1 守护，防越界写。
+                    # REPLICATE_H=1: padding possible (H_per_block > head_kv),
+                    # guard each row with head_idx < H1 against OOB writes.
                     for h_i in range(v_block):
                         head_idx = H0 + vid * v_block + h_i
                         if head_idx < H1:
@@ -399,12 +409,12 @@ def sparse_flash_attention_fwd(
                                     Output[b_i, head_idx, s_i, 0:Dv],
                                 )
 
-                T.set_cross_flag("MTE3", 8)  # 尾声：通知 C 输出完成
+                T.set_cross_flag("MTE3", 8)  # epilogue: notify C the output is done
 
     return main
 
 
-# ========== rev3 kernel：主力路径（固定核 + 共享 gather + R6 软件流水）==========
+# ========== rev3 kernel: main path (fixed cores + shared gather + R6 software pipeline) ==========
 @tilelang.jit(out_idx=[4], workspace_idx=[5, 6, 7, 8, 9, 10], pass_configs=PASS_CONFIGS_V3)
 def sparse_flash_attention_fwd_v3(
     heads,
@@ -425,24 +435,27 @@ def sparse_flash_attention_fwd_v3(
     sm_scale=None,
     core_num=20,
 ):
-    """rev3 主力 kernel：固定核，一个逻辑块 (b, s, kv_group) 的全部 G 个 query
-    head 共享同一份 gather 的 K 行（消除 rev1 每 (b,s,g) 块的 G 倍 gather 放大）。
+    """rev3 main kernel: fixed cores, all G query heads of one logical block
+    (b, s, kv_group) share the same gathered K rows (removes rev1's G-fold
+    gather amplification per (b,s,g) block).
 
-        prologue : Q[全部 G 个 head] -> L1；softmax 状态初始化
-        n-loop   : V0 gather n_base 行 K -> workspace_1/2（双缓冲）
-                   C1 全部 m：scores -> workspace_3
-                   V1 全部 m：causal 选择 + online softmax -> workspace_4
-                   C2 全部 m：PV（B 操作数 = gather 的 K，V == K[:, :dim_v]）-> workspace_5
-                   V2 全部 m：rescale + 累积（NM==1 用 UB，否则 acc_gm）
-        epilogue : 归一化 + 写 Output
+        prologue : Q[all G heads] -> L1; softmax state init
+        n-loop   : V0 gathers n_base K rows -> workspace_1/2 (double buffered)
+                   C1 all m: scores -> workspace_3
+                   V1 all m: causal select + online softmax -> workspace_4
+                   C2 all m: PV (B operand = gathered K, V == K[:, :dim_v])
+                             -> workspace_5
+                   V2 all m: rescale + accumulate (UB when NM==1, else acc_gm)
+        epilogue : normalize + write Output
 
-    value == key[..., :dim_v] 契约（proto.yaml MLA latent KV）让 C2 直接复用
-    gather 的 K 行——完全不需要 gather V。
+    The value == key[..., :dim_v] contract (proto.yaml MLA latent KV) lets C2
+    reuse the gathered K rows directly - V never needs gathering.
 
-    同步：AUTO_CV_SYNC 管跨核 workspace 交接（buffer 名必须含 "workspace"，
-    cube/vec 的 GM 拷贝语句数必须 1:1 配对）；核内顺序用手动 set_flag/wait_flag
-    （AUTO_SYNC 关闭）。acc_gm（NM>1 时的溢出缓冲）刻意避开 "workspace" 命名，
-    以免被 CV pass 接管。
+    Sync: AUTO_CV_SYNC handles the cross-core workspace handoff (buffer names
+    must contain "workspace", and cube/vec GM copy statements must pair 1:1);
+    intra-core ordering uses manual set_flag/wait_flag (AUTO_SYNC off).
+    acc_gm (the NM>1 overflow buffer) deliberately avoids the "workspace"
+    naming so the CV pass does not claim it.
     """
     assert topk % n_base == 0, "topk must be a multiple of n_base"
     assert dim_base % 16 == 0 and (dim_tail == 0 or dim_tail % 16 == 0)
@@ -466,8 +479,9 @@ def sparse_flash_attention_fwd_v3(
     acc_rows = G_pad if NM > 1 else 1  # acc_gm spill only when needed
     acc_cols = dim_v if NM > 1 else 1
 
-    # 静态形状：规避 tilelang 跨进程缓存 bug（符号变量版本在新子进程重试时报
-    # "Unfounded symbolic var"），且磁盘缓存跨进程安全。
+    # Static shapes: sidesteps a tilelang cross-process cache bug (symbolic
+    # variants fail with "Unfounded symbolic var" when a fresh subprocess
+    # retries) and keeps the disk cache safe across processes.
     kernel_count = batch_size * seq_len * kv_groups
 
     if input_layout == 0:  # BSND: [B, S, N, D]
@@ -496,7 +510,7 @@ def sparse_flash_attention_fwd_v3(
         acc_gm: T.Tensor([core_num, acc_rows, acc_cols], accum_dtype),
     ):
         with T.Kernel(core_num, is_npu=True) as (cid, vid):
-            # ---- L1（cube 侧）----
+            # ---- L1 (cube side) ----
             q_l1 = T.alloc_L1([NM, m_base, dim_base], dtype)
             q_tail_l1 = T.alloc_L1([NM, m_base, tail], dtype)
             kv_l1 = T.alloc_L1([n_base, dim_base], dtype)
@@ -505,7 +519,7 @@ def sparse_flash_attention_fwd_v3(
             # ---- L0C ----
             acc_s_l0c = T.alloc_L0C([m_base, n_base], accum_dtype)
             acc_o_l0c = T.alloc_L0C([m_base, dim_v], accum_dtype)
-            # ---- UB（vector 侧）----
+            # ---- UB (vector side) ----
             indices_ub = T.alloc_ub([topk], indices_dtype)
             indices_f = T.alloc_ub([topk], accum_dtype)
             mask_ub = T.alloc_ub([topk // 8], "uint8")
@@ -550,9 +564,11 @@ def sparse_flash_attention_fwd_v3(
             end_idx = T.if_then_else(cid == used_core_num - 1, start_idx + tail_block_size, start_idx + single_core_load)
 
             if cid < used_core_num:
-                # R5-P1：per-CORE 一次性初始化（提到块循环外）。逐块 zero-init
-                # acc_gm 是冗余的：首个 n-iter 的 alpha 恒为 0，残留有限值乘 0
-                # 仍为 0；此处只需防护首块读到未初始化 GM（NaN/Inf 位型）。
+                # R5-P1: one-shot per-CORE init (hoisted out of the block
+                # loop). Zero-initializing acc_gm per block is redundant: the
+                # first n-iter's alpha is always 0, and any residual finite
+                # value times 0 stays 0; this only guards the first block
+                # against reading uninitialized GM (NaN/Inf bit patterns).
                 if NM > 1:
                     T.tile.fill(acc_o_temp, 0.0)
                     T.pipe_barrier("v")
@@ -571,7 +587,7 @@ def sparse_flash_attention_fwd_v3(
                     g_i = block_idx // (seq_len * batch_size)
                     H0 = g_i * G
 
-                    # ---- prologue：Q（全部 head 子块）-> L1 ----
+                    # ---- prologue: Q (all head sub-blocks) -> L1 ----
                     for m_i_ in T.serial(NM):
                         h0 = H0 + m_i_ * m_base
                         h1 = T.if_then_else(h0 + m_base > H0 + G, H0 + G, h0 + m_base)
@@ -584,12 +600,13 @@ def sparse_flash_attention_fwd_v3(
                             if dim_tail > 0:
                                 T.copy(Q[b_i, h0:h1, s_i, dim_base:Dk], q_tail_l1[m_i_, :, :])
 
-                    # ---- prologue：装载全部 indices + causal 掩码（每块一次）----
+                    # ---- prologue: load all indices + causal mask (once per block) ----
                     if input_layout == 0:
                         T.copy(Indices[b_i, s_i, g_i, 0:topk], indices_ub)
                     else:
                         T.copy(Indices[b_i, g_i, s_i, 0:topk], indices_ub)
-                    # indices_ub 就绪：供下方 V 的 cast/compare 与 gather 标量读
+                    # indices_ub ready: feeds the V-side cast/compare below and
+                    # the scalar gather reads
                     T.set_flag("mte2", "v", 5)
                     T.wait_flag("mte2", "v", 5)
                     if is_causal:
@@ -597,27 +614,30 @@ def sparse_flash_attention_fwd_v3(
                         threshold = T.float32(s_i + (seq_len_kv - seq_len))
                         T.tile.compare(mask_ub, indices_f, threshold, "LE")
 
-                    # ---- prologue：softmax 状态初始化 ----
-                    # （acc_gm zero-init 已上提到 per-core 作用域，见上）
+                    # ---- prologue: softmax state init ----
+                    # (acc_gm zero-init hoisted to per-core scope, see above)
                     T.tile.fill(m_i, -(2.0**30))
                     T.tile.fill(sumexp, 0.0)
                     if NM == 1:
                         T.tile.fill(acc_o_ub, 0.0)
 
-                    # R6-P2：软件流水 stage 循环——stage s 发射 n-iter s 的 V0
-                    # gather，同时计算 n-iter s-1，使 cube 对 ws_1[s%2] 的跨核
-                    # 等待与 vector 的 V1/V2(s-1) 重叠（此前串行等 V2 完成：
-                    # 仿真 case 9 中 cube WAIT_FLAG 占 56% 周期）。workspace
-                    # 语句形态不变：c 循环内一条守卫的 V0 写与一条守卫的 C1 读
-                    # 仍 1:1 配对，CV pass 的 per-stage/per-m 交接点不变，
-                    # event id 0-7 未动。
+                    # R6-P2: software-pipelined stage loop - stage s issues
+                    # the V0 gather of n-iter s while computing n-iter s-1, so
+                    # the cube's cross-core wait on ws_1[s%2] overlaps the
+                    # vector's V1/V2(s-1) (previously it serialized behind V2:
+                    # simulation on case 9 showed cube WAIT_FLAG at 56% of
+                    # cycles). Workspace statement shapes unchanged: one
+                    # guarded V0 write and one guarded C1 read inside the c
+                    # loop still pair 1:1, the CV pass per-stage/per-m handoff
+                    # points are untouched, and event ids 0-7 are unchanged.
                     for s_stage in T.serial(NI + 1):
                         if s_stage < NI:
                             vbuf = s_stage % 2
 
-                            # ---- V0：gather n_base 行 K（workspace 双缓冲）----
-                            # 无 AUTO_SYNC：MTE2 行拷贝背靠背发射、无逐行
-                            # barrier；kv_ub 乒乓缓冲，由 mte2<->mte3 flag 保护。
+                            # ---- V0: gather n_base K rows (workspace double buffer) ----
+                            # No AUTO_SYNC: MTE2 row copies issue back-to-back
+                            # with no per-row barrier; kv_ub ping-pongs, guarded
+                            # by the mte2<->mte3 flags.
                             for c in range(n_half // gather_rows):
                                 gt = s_stage * (n_half // gather_rows) + c
                                 task_id = gt % 2
@@ -654,16 +674,18 @@ def sparse_flash_attention_fwd_v3(
                                 if gt < NI * (n_half // gather_rows) - 2:
                                     T.set_flag("mte3", "mte2", task_id)
 
-                        # ---- compute(s-1)：n-iter s_stage-1 的 C1/V1/C2/V2 ----
-                        # 循环体与流水化前逐字一致（i_i = s_stage - 1）。ws_1[(s-2)%2]
-                        # 对 V0(s) 的 WAR 冒险由 ws_4 的 m 级握手链传递覆盖：
-                        # cube 在 m 循环前读 ws_1，m 循环等 V1(s-2)，而 V1(s-2)
-                        # 在 vector 流上先于 V0(s)。
+                        # ---- compute(s-1): C1/V1/C2/V2 of n-iter s_stage-1 ----
+                        # Loop body is verbatim identical to the pre-pipelined
+                        # version (i_i = s_stage - 1). The WAR hazard of
+                        # ws_1[(s-2)%2] against V0(s) is covered transitively by
+                        # the m-level handshake chain over ws_4: cube reads ws_1
+                        # before the m loop, the m loop waits for V1(s-2), and
+                        # V1(s-2) precedes V0(s) on the vector stream.
                         if s_stage >= 1:
                             i_i = s_stage - 1
                             buf = i_i % 2
 
-                            # ---- C1：全部 head 子块的 scores ----
+                            # ---- C1: scores for all head sub-blocks ----
                             T.copy(workspace_1[cid, buf, :, :], kv_l1)
                             if dim_tail > 0:
                                 T.copy(workspace_2[cid, buf, :, :], kv_tail_l1)
@@ -699,7 +721,7 @@ def sparse_flash_attention_fwd_v3(
                                     workspace_5[cid, m_i_ * m_base : (m_i_ + 1) * m_base, :],
                                 )
 
-                            # ---- V1：全部 m 的 causal 选择 + online softmax ----
+                            # ---- V1: causal select + online softmax for all m ----
                             if is_causal:
                                 m_lo = i_i * (n_base // 8)
                                 T.copy(mask_ub[m_lo : m_lo + n_base // 8], mask_iter_ub)
@@ -723,7 +745,8 @@ def sparse_flash_attention_fwd_v3(
                                 T.wait_flag("mte2", "v", 0)
                                 T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
                                 if is_causal:
-                                    # R5-P1：broadcast+add 替代逐行 VSEL（列掩码为常量）。
+                                    # R5-P1: broadcast+add instead of per-row VSEL
+                                    # (the column mask is constant).
                                     T.tile.broadcast(m_bcast, mask_add_ub)
                                     T.tile.add(acc_s_ub, acc_s_ub, m_bcast)
 
@@ -749,13 +772,14 @@ def sparse_flash_attention_fwd_v3(
                                 T.wait_flag("v", "mte3", 1)
                                 T.copy(p_ub, workspace_4[cid, rows0 : rows0 + m_half, :])
 
-                            # ---- V2：全部 m 的 rescale + 累积 ----
+                            # ---- V2: rescale + accumulate for all m ----
                             for m_i_ in T.serial(NM):
                                 rows0 = m_i_ * m_base + vid * m_half
                                 msl = m_i_ * m_half
-                                # R5-P1（已回退）：两个 MTE2 装载共用一个 flag 在
-                                # dim512/NM>1 下产生 NaN——set_flag 降级只与紧邻的
-                                # 前一条 MTE2 配对，不覆盖全部前驱。
+                                # R5-P1 (reverted): sharing one flag between two
+                                # MTE2 loads produced NaN at dim512/NM>1 - the
+                                # degraded set_flag only pairs with the
+                                # immediately preceding MTE2, not all predecessors.
                                 T.copy(workspace_5[cid, rows0 : rows0 + m_half, :], acc_o_temp)
                                 T.set_flag("mte2", "v", 2)
                                 T.wait_flag("mte2", "v", 2)
@@ -774,10 +798,12 @@ def sparse_flash_attention_fwd_v3(
                                     T.set_flag("mte3", "mte2", 7)
                                     T.wait_flag("mte3", "mte2", 7)
 
-                    # ---- epilogue：归一化 + 写 Output ----
-                    # 注意：下方 barrier_all 对 AUTO_CV_SYNC 交接是承重的——移除
-                    # 或上提出 m 循环都会在 dim512/NM>1 下让 1-2% 行变 NaN。它在
-                    # 循环内的精确位置属于 CV 配对节奏，勿动。
+                    # ---- epilogue: normalize + write Output ----
+                    # Note: the barrier_all below is load-bearing for the
+                    # AUTO_CV_SYNC handoff - removing it or hoisting it out of
+                    # the m loop turns 1-2% of rows into NaN at dim512/NM>1.
+                    # Its exact position inside the loop is part of the CV
+                    # pairing rhythm; do not move.
                     for m_i_ in T.serial(NM):
                         rows0 = m_i_ * m_base + vid * m_half
                         msl = m_i_ * m_half
@@ -854,17 +880,21 @@ def sparse_flash_attention_fwd_dense(
     sm_scale=None,
     core_num=20,
 ):
-    """bitmap 加性掩码的稠密 FlashAttention（top-k 预散射）。
+    """Dense FlashAttention with an additive bitmap mask (top-k pre-scattered).
 
-    内部只支持 BNSD（wrapper 用设备侧转置归一化 BSND 输入）：所有 GM->L1/UB
-    源 tile 必须连续——框架 copy_gm_to_l1 对跨步源 tile 会误读（实测 +1 行偏移）。
+    BNSD only internally (the wrapper normalizes BSND input with a
+    device-side transpose): all GM->L1/UB source tiles must be contiguous -
+    the framework copy_gm_to_l1 misreads strided source tiles (measured:
+    +1 row offset).
 
-    Block = (b, head h, s_block)；head -> kv 组用显式 (sb, hg, g, b) 分解
-    （推导式 h//G 索引会在生成的 K 地址里丢掉 g 项）。
+    Block = (b, head h, s_block); head -> kv group uses an explicit
+    (sb, hg, g, b) decomposition (an h//G derived index drops the g term
+    from the generated K addresses).
 
-    本地 flag 用 id 4-7：AUTO_CV_SYNC 的跨核 flag 占用 id 0-2 且与本地 pipe
-    flag 共享 event-id 空间——id 冲突会让 wait_flag 提前消费跨核事件而过早
-    通过，错过 bitmap 的 MTE2 落地。
+    Local flags use ids 4-7: AUTO_CV_SYNC's cross-core flags occupy ids 0-2
+    and share the event-id space with local pipe flags - an id collision
+    lets wait_flag consume a cross-core event early and pass too soon,
+    missing the bitmap's MTE2 landing.
     """
     assert dim_v == dim_base, "dense path requires Dv == largest-pow2(Dk)"
     assert dim_base % 16 == 0 and (dim_tail == 0 or dim_tail % 16 == 0)
@@ -877,8 +907,9 @@ def sparse_flash_attention_fwd_dense(
     Dk = dim_base + dim_tail
     tail = dim_tail if dim_tail > 0 else 1
 
-    # 全静态形状：wrapper 本就按 shape 缓存；静态维度让 codegen 生成编译期
-    # 完整的拷贝守卫（运行时尾守卫的 GM->UB 拷贝在第 >= 1 次迭代会误落）。
+    # Fully static shapes: the wrapper caches per shape anyway; static dims
+    # let codegen emit complete compile-time copy guards (a runtime tail
+    # guard on GM->UB copies mis-lands from the >= 1st iteration).
     s_num = seq_len // m_tile
     kernel_count = batch_size * heads * s_num
 
@@ -893,7 +924,7 @@ def sparse_flash_attention_fwd_dense(
         workspace_5: T.Tensor([core_num, m_tile, dim_v], accum_dtype),
     ):
         with T.Kernel(core_num, is_npu=True) as (cid, vid):
-            # ---- L1（cube 侧）----
+            # ---- L1 (cube side) ----
             q_l1 = T.alloc_L1([m_tile, dim_base], dtype)
             q_tail_l1 = T.alloc_L1([m_tile, tail], dtype)
             kv_l1 = T.alloc_L1([n_base, dim_base], dtype)
@@ -902,7 +933,7 @@ def sparse_flash_attention_fwd_dense(
             # ---- L0C ----
             acc_s_l0c = T.alloc_L0C([m_tile, n_base], accum_dtype)
             acc_o_l0c = T.alloc_L0C([m_tile, dim_v], accum_dtype)
-            # ---- UB（vector 侧，每 AIV 负责 half 行）----
+            # ---- UB (vector side, each AIV handles half the rows) ----
             bm_ub = T.alloc_ub([2, half, n_base], dtype)
             mask_f = T.alloc_ub([half, n_base], accum_dtype)
             acc_s_ub = T.alloc_ub([half, n_base], accum_dtype)
@@ -938,7 +969,7 @@ def sparse_flash_attention_fwd_dense(
 
             if cid < used_core_num:
                 for block_idx in T.serial(start_idx, end_idx):
-                    # 显式分解：sb 最快，其次 hg、g、b
+                    # Explicit decomposition: sb fastest, then hg, g, b
                     sb = block_idx % s_num
                     hg = (block_idx // s_num) % G
                     g_i = (block_idx // (s_num * G)) % kv_groups
@@ -946,12 +977,12 @@ def sparse_flash_attention_fwd_dense(
                     h_i = g_i * G + hg
                     s0 = sb * m_tile
 
-                    # ---- prologue（C）：Q tile（连续 BNSD 行）----
+                    # ---- prologue (C): Q tile (contiguous BNSD rows) ----
                     T.copy(Q[b_i, h_i, s0 : s0 + m_tile, 0:dim_base], q_l1)
                     if dim_tail > 0:
                         T.copy(Q[b_i, h_i, s0 : s0 + m_tile, dim_base:Dk], q_tail_l1)
 
-                    # ---- prologue（V）：softmax 状态初始化 ----
+                    # ---- prologue (V): softmax state init ----
                     T.tile.fill(m_i, -(2.0**30))
                     T.tile.fill(sumexp, 0.0)
                     T.tile.fill(acc_o_ub, 0.0)
@@ -959,7 +990,7 @@ def sparse_flash_attention_fwd_dense(
                     for i_i in T.serial(seq_len_kv // n_base):
                         n0 = i_i * n_base
 
-                        # ---- C：K 块（连续）+ C1 + C2 ----
+                        # ---- C: K chunks (contiguous) + C1 + C2 ----
                         T.copy(K[b_i, g_i, n0 : n0 + n_base, 0:dim_base], kv_l1)
                         if dim_tail > 0:
                             T.copy(K[b_i, g_i, n0 : n0 + n_base, dim_base:Dk], kv_tail_l1)
@@ -978,7 +1009,7 @@ def sparse_flash_attention_fwd_dense(
                         T.gemm_v0(p_l1, kv_l1, acc_o_l0c, init=True, kL0Size=64)
                         T.copy(acc_o_l0c, workspace_5[cid, :, :])
 
-                        # ---- V1：bitmap 加性掩码 + online softmax ----
+                        # ---- V1: additive bitmap mask + online softmax ----
                         rows0 = vid * half
                         T.copy(workspace_3[cid, rows0 : rows0 + half, :], acc_s_ub)
                         T.copy(
@@ -1011,7 +1042,7 @@ def sparse_flash_attention_fwd_dense(
                         T.wait_flag("v", "mte3", 5)
                         T.copy(p_ub, workspace_4[cid, rows0 : rows0 + half, :])
 
-                        # ---- V2：rescale + 累积（UB 常驻）----
+                        # ---- V2: rescale + accumulate (UB-resident) ----
                         T.copy(workspace_5[cid, rows0 : rows0 + half, :], acc_o_temp)
                         T.set_flag("mte2", "v", 6)
                         T.wait_flag("mte2", "v", 6)
@@ -1019,7 +1050,7 @@ def sparse_flash_attention_fwd_dense(
                         T.tile.mul(acc_o_ub, acc_o_ub, alpha_bcast)
                         T.tile.add(acc_o_ub, acc_o_ub, acc_o_temp)
 
-                    # ---- epilogue（V）：归一化 + 输出存储 ----
+                    # ---- epilogue (V): normalize + store output ----
                     T.barrier_all()
                     T.tile.add(sumexp, sumexp, 1e-30)
                     T.tile.broadcast(sum_bcast, sumexp)
@@ -1037,7 +1068,7 @@ def sparse_flash_attention_fwd_dense(
     return main
 
 
-# ========== Python wrapper：路由与缓存 ==========
+# ========== Python wrapper: routing and caches ==========
 
 
 def sparse_flash_attention(
@@ -1049,19 +1080,20 @@ def sparse_flash_attention(
     inputLayout: str = "BSND",
     is_causal: bool = False,
 ) -> torch.Tensor:
-    """Sparse FlashAttention Python wrapper。
+    """Sparse FlashAttention Python wrapper.
 
     Args:
-        query: [B,S1,N1,Dk]（BSND）或 [B,N1,S1,Dk]（BNSD），float16/bfloat16。
-        key:   [B,S2,N2,Dk] / [B,N2,S2,Dk]。
-        value: [B,S2,N2,Dv] / [B,N2,S2,Dv]；Dv <= Dk，value == key[..., :Dv]。
-        sparseIndices: [B,S1,N2,topK] / [B,N2,S1,topK]，int32，取值 [0, S2)。
-        scaleValue: 缩放系数（通常 1/sqrt(Dk)）。
-        inputLayout: "BSND" 或 "BNSD"。
-        is_causal: 在稀疏 gather 之上叠加右下对齐的 causal 掩码。
+        query: [B,S1,N1,Dk] (BSND) or [B,N1,S1,Dk] (BNSD), float16/bfloat16.
+        key:   [B,S2,N2,Dk] / [B,N2,S2,Dk].
+        value: [B,S2,N2,Dv] / [B,N2,S2,Dv]; Dv <= Dk, value == key[..., :Dv].
+        sparseIndices: [B,S1,N2,topK] / [B,N2,S1,topK], int32, values in [0, S2).
+        scaleValue: scaling factor (usually 1/sqrt(Dk)).
+        inputLayout: "BSND" or "BNSD".
+        is_causal: additionally apply a bottom-right aligned causal mask on
+            top of the sparse gather.
 
     Returns:
-        output [B,S1,N1,Dv] / [B,N1,S1,Dv]，dtype 同 query。
+        output [B,S1,N1,Dv] / [B,N1,S1,Dv], dtype follows query.
     """
     if inputLayout == "BSND":
         B, S1, N1, Dk = query.shape
@@ -1086,19 +1118,53 @@ def sparse_flash_attention(
     head_block = 64 if Dv <= 256 else 32
     layout_code = 0 if inputLayout == "BSND" else 1
 
-    # R3-2：高查询复用 shape（B 族）走 dense 掩码路径——gather 放大
-    # S1*topk/S2 >= 16 时稀疏路径受标量发射限制；dense 改为流式读全部
-    # S2 行 K + bitmap 加性掩码（与 golden 的 scatter 掩码语义一致）。
+    # ---------------------------------------------------------------------------
+    # Path selection: static shape analysis, not autotuning.
+    #
+    # Each (shape, dtype) routes to exactly one of the three compiled kernels,
+    # picked by cheap host-side constraint checks in fixed priority order:
+    #
+    #   1. dense  - dense attention over an additive 0/-inf bitmap pre-scattered
+    #      from sparseIndices. Wins when queries reuse keys heavily:
+    #      amplification amp = S1*topK/S2 >= 16 is where the gather paths
+    #      become scalar-issue bound (msprof: aiv_scalar 55% on case 1).
+    #      Constraints: S2 % 256 == 0 (n_base blocking), dim_base == 128,
+    #      dim_tail in {0, 64}, Dv == dim_base, S1 % 64 == 0 (m_tile).
+    #
+    #   2. rev3 (v3) - fixed-core persistent kernel; all G query heads of a
+    #      (b, s, kv_group) block share one gathered K (removes the G-fold
+    #      gather amplification of rev1). Constraints: topK % 256 == 0,
+    #      Dv == largest-pow2(Dk) (C2 reuses the gathered K as B operand),
+    #      dim_tail in {0, 64}, dim_base in {128, 512}, and an L1 tile budget
+    #      <= 480KB (checked below via l1_bytes).
+    #
+    #   3. rev1 - universal fallback, any legal shape (one (b, s, kv_group)
+    #      chunk per kernel block).
+    #
+    # Tiling parameters are fixed per path, not searched: each value is the
+    # best of the candidates measured during tuning (rejected experiments in
+    # perf_tuning/board/optimization_log.md), bounded by a hardware budget -
+    # e.g. n_base=256 keeps the 64KB B subblock within the 32KB L0B ping-pong
+    # slot; gather_rows=64 halves V0 ping-pong chunks for dim<=128 while
+    # dim512 needs 16 to stay under ~248KB usable UB. Kernels are compiled
+    # once per shape and cached in _kernel_cache.
+    # ---------------------------------------------------------------------------
+    # R3-2: high query-reuse shapes (family B) take the dense mask path -
+    # beyond gather amplification S1*topk/S2 >= 16 the sparse paths are
+    # scalar-issue bound; dense instead streams all S2 rows of K with the
+    # additive bitmap mask (same semantics as the golden's scatter mask).
     m_tile_dense = 64
     G = N1 // N2
     amp = S1 * topK / S2
     dense_ok = amp >= 16 and S2 % 256 == 0 and dim_base == 128 and dim_tail in (0, 64) and Dv == dim_base and S1 % m_tile_dense == 0
 
     if dense_ok:
-        # 平台兼容守护（R3/R4）：CANN 构建缺 aclnn 算子变体的 SoC（如
-        # Ascend910_93 / CANN 9.1 报 "aclnnCast failed, 561103"）上，本路径
-        # 任何失败都回退到下方 v3/rev1 gather 路径——全 shape 正确，仅慢。
-        # 失败 stage 一次性打印到 stderr 供平台定位（见 _dense_log_once）。
+        # Platform guard (R3/R4): on SoCs whose CANN build lacks aclnn
+        # operator variants (e.g. Ascend910_93 / CANN 9.1 fails with
+        # "aclnnCast failed, 561103"), any failure here falls back to the
+        # v3/rev1 gather paths below - correct for all shapes, just slower.
+        # The failing stage is printed to stderr once for platform triage
+        # (see _dense_log_once).
         stage = "compile"
         try:
             cache_key = ("dense", B, S1, S2, N1, N2, dim_base, dim_tail, Dv, layout_code, dtype_str, float(scaleValue), _ai_core_num())
@@ -1180,8 +1246,9 @@ def sparse_flash_attention(
                 if len(_bitmap_cache) >= _BITMAP_CACHE_MAX:
                     _bitmap_cache.pop(next(iter(_bitmap_cache)))
                 _bitmap_cache[bm_key] = bitmap
-            # dense kernel 仅支持 BNSD（GM->L1 源 tile 必须连续，框架误读跨步
-            # tile）；BSND 输入用设备侧转置归一，输出再转回。
+            # The dense kernel is BNSD-only (GM->L1 source tiles must be
+            # contiguous; the framework misreads strided tiles); BSND input is
+            # normalized with a device-side transpose and transposed back.
             stage = "transpose"
             if inputLayout == "BSND":
                 q_in = query.transpose(1, 2).contiguous()
@@ -1198,17 +1265,21 @@ def sparse_flash_attention(
                 _dense_fb_logged,
                 f"[sfa-dense-fallback] stage={stage}: {type(e).__name__}: {e}",
             )
-            # 本环境 dense 快路径不可用——落到下方 v3/rev1 gather 路径。
+            # The dense fast path is unavailable here - fall through to the
+            # v3/rev1 gather paths below.
 
-    # rev3 快路径约束：topk 按 n_base=256 整除；Dv == largest-pow2(Dk)（C2 的
-    # B 操作数直接用 gather 的 K）；dim_tail ∈ {0, 64}；L1 预算 <= 480KB。
-    # UB 预算（196KB/核）：Dv=512 工作集需 m_base=16；Dv<=256 用 m_base=32 有余量。
+    # rev3 fast-path constraints: topk divisible by n_base=256; Dv ==
+    # largest-pow2(Dk) (C2's B operand reuses the gathered K); dim_tail in
+    # {0, 64}; L1 budget <= 480KB. UB budget (196KB/core): the Dv=512 working
+    # set needs m_base=16; Dv<=256 has headroom with m_base=32.
     m_base_v3 = 32
-    # n_base 固定 256（R5-P1 已否决 512：C1 是 transpose_B=True，gemm_v0 的
-    # N-tiling 修复只覆盖 transpose_B==false，N=512 会把 64KB B 子块塞进
-    # 32KB L0B 乒乓槽，运行时 cube 崩 ERR99999，实测）。
-    # gather_rows：dim_base<=128 用 64（V0 乒乓块数减半）；dim512 保持 16
-    # （gr=32 会把 kv_ub 推过 ~248KB 可用 UB，静默 NaN，实测）。
+    # n_base fixed at 256 (512 rejected in R5-P1: C1 uses transpose_B=True,
+    # the gemm_v0 N-tiling fix only covers transpose_B==false, and N=512
+    # stuffs a 64KB B subblock into the 32KB L0B ping-pong slot - the cube
+    # crashes with ERR99999 at runtime, measured).
+    # gather_rows: 64 for dim_base<=128 (halves the V0 ping-pong chunk count);
+    # dim512 stays at 16 (gr=32 pushes kv_ub past ~248KB of usable UB -
+    # silently NaNs, measured).
     n_base_v3 = 256
     gather_rows_v3 = 64 if dim_base <= 128 else 16
     l1_bytes = (
