@@ -173,12 +173,13 @@ def test_sparse_flash_attention_l0():
         except Exception as e:
             print(f"[PRECISION_FAIL] {name}: {type(e).__name__}: {e}")
             ok = False
-    return ok
+    assert ok, "L0 precision tests failed"
 
 
 # ========== L1 tests: functional (layout / causal / dims variants) ==========
 def test_sparse_flash_attention_l1():
-    """L1 functional tests: BNSD layout, causal (v3 + dense), Dv<Dk, Dk tail, G=1, small topK."""
+    """L1 functional tests: BNSD layout, causal (v3 + dense + all-masked), Dv<Dk,
+    Dk tail, G=1, small topK, odd G."""
     test_configs = [
         # (name, B, S1, S2, N1, N2, Dk, Dv, topK, layout, dtype_str, is_causal)
         ("l1_bnsd_layout", 8, 1, 1024, 32, 8, 128, 128, 512, "BNSD", "float16", False),
@@ -188,6 +189,14 @@ def test_sparse_flash_attention_l1():
         ("l1_dk_tail192", 2, 8, 1024, 32, 8, 192, 128, 512, "BSND", "float16", False),
         ("l1_mha_g1", 2, 64, 2048, 16, 16, 128, 128, 256, "BSND", "float16", False),
         ("l1_topk64", 1, 16, 2048, 128, 8, 128, 128, 64, "BSND", "float16", False),
+        # odd G routed to rev1: H_per_block rounds up to even, the tail head
+        # must still be processed (regression: N1=17, N2=1 used to drop head 16)
+        ("l1_odd_g_rev1", 1, 4, 128, 17, 1, 128, 128, 64, "BSND", "float16", False),
+        # S1 > S2 + causal: rows s < S1-S2 are fully masked and must output 0.
+        # S2 % 256 != 0 keeps both off the dense route: topK=256 -> v3,
+        # topK=128 -> rev1 (covers -inf masking on both gather paths).
+        ("l1_all_masked_v3", 1, 512, 384, 8, 8, 128, 128, 256, "BSND", "float16", True),
+        ("l1_all_masked_rev1", 1, 512, 384, 8, 8, 128, 128, 128, "BSND", "float16", True),
     ]
 
     ok = True
@@ -198,7 +207,38 @@ def test_sparse_flash_attention_l1():
         except Exception as e:
             print(f"[PRECISION_FAIL] {name}: {type(e).__name__}: {e}")
             ok = False
-    return ok
+
+    # Regression (bitmap cache): the same sparseIndices tensor reused across
+    # two calls with different S2 must not hit a stale cached bitmap - the
+    # cache key has to distinguish S2, otherwise the second call reads a
+    # wrong-shaped mask.
+    B, S1, N1, N2, Dk, Dv, topK = 2, 256, 32, 8, 128, 128, 512
+    scale = 1.0 / (Dk**0.5)
+    q, k_small, v_small, si = make_input(B, S1, 512, N1, N2, Dk, Dv, topK, "BSND", "float16", seed=11)
+    gen = torch.Generator().manual_seed(12)
+    k_big = (torch.rand(B, 1024, N2, Dk, generator=gen) * 2 - 1).to(torch.float16)
+    v_big = k_big[..., :Dv].clone()
+    for name, k, v, s2 in (
+        ("l1_bitmap_cache_s2_a", k_small, v_small, 512),
+        ("l1_bitmap_cache_s2_b", k_big, v_big, 1024),
+    ):
+        try:
+            out = sparse_flash_attention(q.npu(), k.npu(), v.npu(), si.npu(), scale, "BSND", False)
+            torch.npu.synchronize()
+            golden = golden_sparse_flash_attention(q, k, v, si, scale, "BSND", False)
+            passed, ratio, max_abs = check_precision(out, golden.to(out.dtype), "float16")
+            tag = "PASS" if passed else "FAIL"
+            print(
+                f"[PRECISION_{tag}] {name} B={B} S1={S1} S2={s2} N1={N1} N2={N2} "
+                f"Dk={Dk} Dv={Dv} topK={topK} layout=BSND causal=False "
+                f"dtype=float16 matched_ratio={ratio:.4f} max_abs={max_abs:.3e}"
+            )
+            ok &= passed
+        except Exception as e:
+            print(f"[PRECISION_FAIL] {name}: {type(e).__name__}: {e}")
+            ok = False
+
+    assert ok, "L1 functional tests failed"
 
 
 # ========== L2 tests: negative (invalid inputs must be rejected) ==========
@@ -208,36 +248,41 @@ def test_sparse_flash_attention_l2():
     def _expect_reject(desc, fn):
         try:
             fn()
-            print(f"[BOUNDARY_WARN] {desc}: silently accepted (should have raised)")
+            print(f"[L2_FAIL] {desc}: silently accepted (should have raised)")
+            return False
         except (ValueError, AssertionError, RuntimeError):
-            print(f"[BOUNDARY_PASS] {desc}: correctly rejected")
+            print(f"[L2_PASS] {desc}: correctly rejected")
+            return True
 
     q, k, v, si = make_input(1, 8, 256, 8, 8, 128, 128, 256, "BSND", "float16")
     q_npu, k_npu, v_npu, si_npu = q.npu(), k.npu(), v.npu(), si.npu()
     scale = 1.0 / (128**0.5)
 
-    _expect_reject(
+    ok = True
+    ok &= _expect_reject(
         "layout_invalid",
         lambda: sparse_flash_attention(q_npu, k_npu, v_npu, si_npu, scale, "BSHD", False),
     )
 
     q2, k2, v2, si2 = make_input(1, 8, 256, 8, 3, 128, 128, 256, "BSND", "float16")
-    _expect_reject(
+    ok &= _expect_reject(
         "n1_not_divisible_by_n2",
         lambda: sparse_flash_attention(q2.npu(), k2.npu(), v2.npu(), si2.npu(), scale, "BSND", False),
     )
 
     v_wide = torch.randn(1, 256, 8, 256, dtype=torch.float16).npu()
-    _expect_reject(
+    ok &= _expect_reject(
         "dv_greater_than_dk",
         lambda: sparse_flash_attention(q_npu, k_npu, v_wide, si_npu, scale, "BSND", False),
     )
 
     si_pad = torch.cat([si, si], dim=-1).npu()
-    _expect_reject(
+    ok &= _expect_reject(
         "topk_greater_than_s2",
         lambda: sparse_flash_attention(q_npu, k_npu, v_npu, si_pad, scale, "BSND", False),
     )
+
+    assert ok, "L2 negative tests failed"
 
 
 # ========== Boundary tests: special values ==========
@@ -257,16 +302,30 @@ def test_sparse_flash_attention_boundary():
         torch.npu.synchronize()
         golden = golden_sparse_flash_attention(q, k, v, si, scale, layout, is_causal)
         passed, ratio, max_abs = check_precision(out, golden.to(out.dtype), dtype_str)
-        tag = "PASS" if passed else "WARN"
+        tag = "PASS" if passed else "FAIL"
         print(f"[BOUNDARY_{tag}] {name} matched_ratio={ratio:.4f} max_abs={max_abs:.3e}")
+        return passed
 
-    _run_special("topk_equals_s2", 1, 8, 256, 8, 8, 128, 128, 256, "BSND", "float16", False, None)
-    _run_special("causal_all_masked_rows", 1, 512, 256, 8, 8, 128, 128, 256, "BSND", "float16", True, None)
-    _run_special("zero_query_uniform", 1, 8, 512, 8, 8, 128, 128, 256, "BSND", "float16", False, "zero_q")
-    _run_special("large_amplitude", 1, 8, 512, 8, 8, 128, 128, 256, "BSND", "float16", False, "large")
+    ok = True
+    ok &= _run_special("topk_equals_s2", 1, 8, 256, 8, 8, 128, 128, 256, "BSND", "float16", False, None)
+    ok &= _run_special("causal_all_masked_rows", 1, 512, 256, 8, 8, 128, 128, 256, "BSND", "float16", True, None)
+    ok &= _run_special("zero_query_uniform", 1, 8, 512, 8, 8, 128, 128, 256, "BSND", "float16", False, "zero_q")
+    ok &= _run_special("large_amplitude", 1, 8, 512, 8, 8, 128, 128, 256, "BSND", "float16", False, "large")
+    assert ok, "boundary special-value tests failed"
 
 
 # ========== Main: --level dispatch + exit code ==========
+def _run_level(fn):
+    """Run one level; an AssertionError marks the level failed (pytest runs the
+    test functions directly and fails on the same asserts)."""
+    try:
+        fn()
+        return True
+    except AssertionError as e:
+        print(f"[LEVEL_FAIL] {fn.__name__}: {e}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--level", default="l0", choices=["l0", "l1", "l2", "boundary", "all"])
@@ -275,17 +334,17 @@ def main():
     tilelang.disable_cache()  # Disable compile cache to avoid stale artifacts
     torch.manual_seed(0)
 
-    blocking_ok = True  # Only L0/L1 count toward blocking
+    ok = True
     if args.level in ("l0", "all"):
-        blocking_ok &= test_sparse_flash_attention_l0()
+        ok &= _run_level(test_sparse_flash_attention_l0)
     if args.level in ("l1", "all"):
-        blocking_ok &= test_sparse_flash_attention_l1()
+        ok &= _run_level(test_sparse_flash_attention_l1)
     if args.level in ("l2", "all"):
-        test_sparse_flash_attention_l2()  # L2: correct rejection=PASS, silent accept=WARN, non-blocking
+        ok &= _run_level(test_sparse_flash_attention_l2)
     if args.level in ("boundary", "all"):
-        test_sparse_flash_attention_boundary()  # Boundary: precision fail=WARN, non-blocking
+        ok &= _run_level(test_sparse_flash_attention_boundary)
 
-    if blocking_ok:
+    if ok:
         print("Test Passed!")
         sys.exit(0)
     sys.exit(1)
