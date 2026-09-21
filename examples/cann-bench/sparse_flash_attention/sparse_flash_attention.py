@@ -132,19 +132,20 @@ def sparse_flash_attention_fwd(
     Dk = dim_base + dim_tail
 
     head_kv = heads // kv_groups  # G: query heads per kv head
-    # Large G is split into head_block chunks; small G is padded to >= 16
-    # (L0C fractal alignment). H_per_block must stay even: the vector side
-    # covers rows as 2 * v_block (one half per AIV), so an odd value would
-    # silently drop the last query head.
+    # Large G is split into head_block chunks; small G is padded up to a
+    # multiple of 16. Two alignment constraints: the cube-side L0C fractal
+    # (M dim), and v_block = H_per_block // 2 must stay a multiple of 8 for
+    # the 32B-aligned per-row vector buffers - an odd H_per_block would also
+    # leave the last query head unprocessed (vector side covers exactly
+    # 2 * v_block rows). Padding rows are guarded by head_idx < H1 on the
+    # output write.
     if head_kv > head_block:
         assert head_kv % head_block == 0, "head_kv must be a multiple of head_block"
         REPLICATE_H = head_kv // head_block
         H_per_block = head_block
     else:
         REPLICATE_H = 1
-        H_per_block = max(head_kv, 16)
-        if H_per_block % 2 == 1:
-            H_per_block += 1
+        H_per_block = (max(head_kv, 16) + 15) // 16 * 16
     v_block = H_per_block // 2
     ub_len = max(32 // (DataType(accum_dtype).bits // 8), v_block)  # UB 32B 对齐
 
