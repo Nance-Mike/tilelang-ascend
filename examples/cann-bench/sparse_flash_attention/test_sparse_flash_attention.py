@@ -218,12 +218,18 @@ def test_sparse_flash_attention_l1():
     gen = torch.Generator().manual_seed(12)
     k_big = (torch.rand(B, 1024, N2, Dk, generator=gen) * 2 - 1).to(torch.float16)
     v_big = k_big[..., :Dv].clone()
+    # Materialize the loop-invariant device tensors once, outside the loop.
+    # The bitmap cache is keyed on sparseIndices.data_ptr(): calling si.npu()
+    # inside the loop allocates a fresh device tensor (new data_ptr) on every
+    # iteration, so the two calls would never share a cache entry and the
+    # S2-in-key regression below would silently not be exercised.
+    q_npu, si_npu = q.npu(), si.npu()
     for name, k, v, s2 in (
         ("l1_bitmap_cache_s2_a", k_small, v_small, 512),
         ("l1_bitmap_cache_s2_b", k_big, v_big, 1024),
     ):
         try:
-            out = sparse_flash_attention(q.npu(), k.npu(), v.npu(), si.npu(), scale, "BSND", False)
+            out = sparse_flash_attention(q_npu, k.npu(), v.npu(), si_npu, scale, "BSND", False)
             torch.npu.synchronize()
             golden = golden_sparse_flash_attention(q, k, v, si, scale, "BSND", False)
             passed, ratio, max_abs = check_precision(out, golden.to(out.dtype), "float16")
