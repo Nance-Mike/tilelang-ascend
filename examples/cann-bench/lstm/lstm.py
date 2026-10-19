@@ -1105,6 +1105,7 @@ def lstm(
     del dropout  # inference semantics: no-op (matches the golden reference)
     D = 2 if bidirectional else 1
     L = int(numLayers)
+    assert L >= 1, f"numLayers must be >= 1, got {numLayers}"
     H = int(hiddenSize)
     F = int(inputSize)
     H4 = 4 * H
