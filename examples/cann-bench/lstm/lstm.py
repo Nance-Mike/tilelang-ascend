@@ -28,9 +28,8 @@ states are all fp32 (gates and c persist through fp32 GM, so there is no
 per-step quantization); h is relayed through a hi/lo dtype pair whose effective
 precision is far better than a single dtype.
 
-Platform compatibility (910_93/CANN 9.1, job_b716a06aba7a: 20/20 blocked by
-aclnnInplaceZero 561103): the wrapper drops every dispatched aclnn op
-(torch.zeros / fill_ / contiguous). Zero filling goes through
+Platform compatibility (910_93/CANN 9.1): the wrapper drops every dispatched
+aclnn op (torch.zeros / fill_ / contiguous). Zero filling goes through
 _lstm_zero_kernel (UB fill -> copy to GM); large buffers are read only after a
 full-width overwrite, so a plain empty is safe; the y output returns a dense
 view (compacted by gather when DPO is unaligned), which satisfies the harness
@@ -147,7 +146,7 @@ def _zero_fill(t):
     return t
 
 
-# PERF(#11): a permanently-zero region only needs to be filled once. The
+# PERF: a permanently-zero region only needs to be filled once. The
 # zero regions of these buffers (pad columns / default h0,c0 / h_zero /
 # proj h_lo) are never written by a kernel and their valid regions are
 # rewritten on every call, so the same block is reused across calls keyed
@@ -1469,7 +1468,7 @@ def lstm(
 
     # ---- 6) make the y output contiguous (harness contract: the returned
     #          tensor must be contiguous) ----
-    # job_145831e43cac: when DPO != DPO_pad a narrow-slice view is rejected as
+    # When DPO != DPO_pad a narrow-slice view is rejected as
     # "output memory layout not contiguous" and scores zero outright (the old
     # assumption that .cpu() materializes the view does not hold).
     # .contiguous() is not an option (a dispatched aclnn copy op, all removed
@@ -1478,7 +1477,7 @@ def lstm(
     # 18/20) the scatter output is already dense row-major, so a plain view is
     # contiguous and no device work is needed; in the unaligned cases
     # (hiddenSize=127/31) the scatter row width has to stay DPO_pad-aligned
-    # (the T.copy tail-truncation constraint, see debug_log round 7), so one
+    # (the T.copy tail-truncation constraint), so one
     # extra gather compacts it to the exact width. The 128->127 (fp32) and
     # 32->31 (bf16) combinations were measured to pass through the hn/cn path
     # in the harness (case17/18 hn/cn pass).
